@@ -247,6 +247,7 @@ impl eframe::App for VeilKeyApp {
                 let mut toggle = None;
                 let mut delete = None;
                 let mut hotkey_save = None;
+                let mut group_option_changed = false;
                 for (index, group) in self.state.groups.iter_mut().enumerate() {
                     ui.separator();
                     ui.horizontal(|ui| {
@@ -286,6 +287,15 @@ impl eframe::App for VeilKeyApp {
                             hotkey_save = Some((index, value));
                         }
                     });
+                    if ui
+                        .checkbox(
+                            &mut group.force_popup,
+                            "Force popup (keep above, don't focus)",
+                        )
+                        .changed()
+                    {
+                        group_option_changed = true;
+                    }
                 }
                 if let Some(index) = delete {
                     if let Some(group) = self.state.groups.get(index) {
@@ -304,6 +314,9 @@ impl eframe::App for VeilKeyApp {
                 }
                 if let Some((index, value)) = hotkey_save {
                     self.register_group_hotkey(index, value);
+                }
+                if group_option_changed {
+                    self.persist();
                 }
                 if let Some(index) = toggle {
                     self.toggle_group(index);

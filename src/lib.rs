@@ -31,6 +31,8 @@ pub struct Group {
     pub hotkey: Option<String>,
     pub is_visible: bool,
     #[serde(default)]
+    pub force_popup: bool,
+    #[serde(default)]
     pub restore_rects: BTreeMap<String, Rect>,
 }
 
@@ -51,6 +53,7 @@ pub enum WindowAction {
         window_id: String,
         handle: isize,
         visible: bool,
+        force_popup: bool,
     },
     SetRect {
         window_id: String,
@@ -76,6 +79,7 @@ impl AppState {
             window_ids: std::mem::take(&mut self.selected_windows),
             hotkey: None,
             is_visible: true,
+            force_popup: false,
             restore_rects: BTreeMap::new(),
         });
         self.new_group_name.clear();
@@ -105,6 +109,7 @@ impl AppState {
                         window_id: id.clone(),
                         handle: window.native_handle,
                         visible: false,
+                        force_popup: group.force_popup,
                     });
                 }
             }
@@ -123,6 +128,7 @@ impl AppState {
                         window_id: id.clone(),
                         handle: window.native_handle,
                         visible: true,
+                        force_popup: group.force_popup,
                     });
                 }
             }
@@ -241,12 +247,14 @@ mod tests {
                 WindowAction::SetVisible {
                     window_id: "a".into(),
                     handle: 1,
-                    visible: false
+                    visible: false,
+                    force_popup: false
                 },
                 WindowAction::SetVisible {
                     window_id: "b".into(),
                     handle: 2,
-                    visible: false
+                    visible: false,
+                    force_popup: false
                 },
             ]
         );
@@ -276,7 +284,8 @@ mod tests {
                 WindowAction::SetVisible {
                     window_id: "a".into(),
                     handle: 1,
-                    visible: true
+                    visible: true,
+                    force_popup: false
                 },
                 WindowAction::SetRect {
                     window_id: "b".into(),
@@ -291,7 +300,8 @@ mod tests {
                 WindowAction::SetVisible {
                     window_id: "b".into(),
                     handle: 2,
-                    visible: true
+                    visible: true,
+                    force_popup: false
                 },
             ]
         );

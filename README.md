@@ -10,6 +10,8 @@ VeilKey is in early development. The current build includes a basic group manage
 
 On macOS, grant VeilKey permission under **System Settings → Privacy & Security → Accessibility**. Window discovery and control depend on that permission. On Windows, windows must expose a title and a usable top-level window handle to be listed and controlled.
 
+On Windows, groups show windows without requesting foreground activation. The optional **Force popup (keep above, don't focus)** setting uses a non-activating topmost placement when showing the group; it is intended for ordinary and borderless-fullscreen desktops. It does not change display resolution or DPI scaling. Leave it off for games if any overlay could cover game content. Exclusive-fullscreen games control the display directly, so Windows cannot guarantee that another app will appear above them; VeilKey also cannot guarantee zero presentation stutter on every GPU/driver/game combination. Prefer the game's borderless-fullscreen mode when you need other windows to appear over it.
+
 The UI and native window adapters are still evolving. In particular, shortcut capture, automatic recovery after another application takes a shortcut, signed/notarized distribution, and long-duration testing on real desktops remain future work. Please report platform-specific issues with OS version and steps to reproduce.
 
 ## Build

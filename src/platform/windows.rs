@@ -8,7 +8,8 @@ use windows::Win32::System::Threading::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    IsWindowVisible, SW_HIDE, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+    HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
     ShowWindowAsync,
 };
 
@@ -96,6 +97,7 @@ impl NativeWindowController {
                 window_id,
                 handle,
                 visible,
+                ..
             } => (window_id.as_str(), *handle, Some(*visible)),
             WindowAction::SetRect {
                 window_id, handle, ..
@@ -112,9 +114,48 @@ impl NativeWindowController {
         };
         let hwnd = HWND(handle as *mut core::ffi::c_void);
         match action {
-            WindowAction::SetVisible { visible, .. } => unsafe {
-                let _ = ShowWindowAsync(hwnd, if visible { SW_RESTORE } else { SW_HIDE });
-                Ok(())
+            WindowAction::SetVisible {
+                visible,
+                force_popup,
+                ..
+            } => unsafe {
+                if visible {
+                    // Showing without activation avoids stealing focus from games and full-screen apps.
+                    let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+                    SetWindowPos(
+                        hwnd,
+                        if force_popup {
+                            HWND_TOPMOST
+                        } else {
+                            HWND_NOTOPMOST
+                        },
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE
+                            | SWP_NOSIZE
+                            | SWP_NOACTIVATE
+                            | SWP_SHOWWINDOW
+                            | SWP_NOOWNERZORDER,
+                    )
+                    .map_err(|e| e.to_string())
+                } else {
+                    if force_popup {
+                        // Clear only VeilKey's topmost placement; ordinary groups preserve app z-order.
+                        let _ = SetWindowPos(
+                            hwnd,
+                            HWND_NOTOPMOST,
+                            0,
+                            0,
+                            0,
+                            0,
+                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                        );
+                    }
+                    let _ = ShowWindowAsync(hwnd, SW_HIDE);
+                    Ok(())
+                }
             },
             WindowAction::SetRect { rect, .. } => unsafe {
                 SetWindowPos(

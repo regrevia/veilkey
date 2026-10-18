@@ -27,8 +27,9 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo build --release --target ${{ matrix.target }}
       - name: Stage artifact
-        shell: pwsh
-        run: Copy-Item "target/${{ matrix.target }}/release/veilkey${{ endsWith(matrix.suffix, '.exe') && '.exe' || '' }}" "veilkey-${{ matrix.suffix }}"
+        shell: bash
+        run: cp "target/${{ matrix.target }}/release/veilkey${{ endsWith(matrix.suffix, '.exe') && '.exe' || '' }}" "veilkey-${{ matrix.suffix }}"
       - uses: softprops/action-gh-release@v2
         with:
           files: veilkey-${{ matrix.suffix }}
+

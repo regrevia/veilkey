@@ -108,6 +108,20 @@ impl NativeWindowController {
         }
         result
     }
+
+    pub fn apply_actions(actions: Vec<WindowAction>) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for action in actions {
+            if let Err(error) = Self::apply(action) {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
 }
 
 fn collect_windows() -> Result<Vec<RawWindow>, String> {

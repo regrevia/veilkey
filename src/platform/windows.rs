@@ -7,10 +7,10 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
-    HWND_NOTOPMOST, HWND_TOPMOST, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos,
-    ShowWindowAsync,
+    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible, SW_HIDE,
+    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
+    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
 };
 
 #[derive(Clone)]
@@ -92,91 +92,138 @@ impl NativeWindowController {
     }
 
     pub fn apply(action: WindowAction) -> Result<(), String> {
-        let (window_id, handle, visibility) = match &action {
-            WindowAction::SetVisible {
-                window_id,
-                handle,
-                visible,
-                ..
-            } => (window_id.as_str(), *handle, Some(*visible)),
-            WindowAction::SetRect {
-                window_id, handle, ..
-            } => (window_id.as_str(), *handle, None),
-        };
-        let current = Self::enumerate()?;
-        let Some(window) = current
-            .iter()
-            .find(|window| window.id == window_id && window.native_handle == handle)
-        else {
-            return Err(
-                "The selected window no longer exists. Refresh the list and rebind it.".into(),
-            );
-        };
-        let hwnd = HWND(handle as *mut core::ffi::c_void);
-        match action {
-            WindowAction::SetVisible {
-                visible,
-                force_popup,
-                ..
-            } => unsafe {
-                if visible {
-                    // Showing without activation avoids stealing focus from games and full-screen apps.
-                    let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
-                    SetWindowPos(
-                        hwnd,
-                        if force_popup {
-                            HWND_TOPMOST
-                        } else {
-                            HWND_NOTOPMOST
-                        },
-                        0,
-                        0,
-                        0,
-                        0,
-                        SWP_NOMOVE
-                            | SWP_NOSIZE
-                            | SWP_NOACTIVATE
-                            | SWP_SHOWWINDOW
-                            | SWP_NOOWNERZORDER,
-                    )
-                    .map_err(|e| e.to_string())
-                } else {
-                    if force_popup {
-                        // Clear only VeilKey's topmost placement; ordinary groups preserve app z-order.
-                        let _ = SetWindowPos(
-                            hwnd,
-                            HWND_NOTOPMOST,
-                            0,
-                            0,
-                            0,
-                            0,
-                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                        );
-                    }
-                    let _ = ShowWindowAsync(hwnd, SW_HIDE);
-                    Ok(())
-                }
-            },
-            WindowAction::SetRect { rect, .. } => unsafe {
-                SetWindowPos(
-                    hwnd,
-                    None,
-                    rect.x,
-                    rect.y,
-                    rect.width,
-                    rect.height,
-                    SWP_NOZORDER | SWP_NOACTIVATE,
-                )
-                .map_err(|e| e.to_string())
-            },
+        Self::apply_actions(vec![action])
+    }
+
+    pub fn apply_actions(actions: Vec<WindowAction>) -> Result<(), String> {
+        if actions.is_empty() {
+            return Ok(());
         }
-        .and_then(|_| {
-            if visibility.is_some() && window.title.is_empty() {
-                Err("Window identity validation failed".into())
-            } else {
-                Ok(())
+        let foreground_before = unsafe { GetForegroundWindow() };
+        let hiding = actions
+            .iter()
+            .any(|action| matches!(action, WindowAction::SetVisible { visible: false, .. }));
+        let hidden_handles: Vec<isize> = actions
+            .iter()
+            .filter_map(|action| match action {
+                WindowAction::SetVisible {
+                    handle,
+                    visible: false,
+                    ..
+                } => Some(*handle),
+                _ => None,
+            })
+            .collect();
+        let current = Self::enumerate()?;
+        let mut errors = Vec::new();
+        for action in actions {
+            let (window_id, handle) = match &action {
+                WindowAction::SetVisible {
+                    window_id, handle, ..
+                }
+                | WindowAction::SetRect {
+                    window_id, handle, ..
+                } => (window_id.as_str(), *handle),
+            };
+            let Some(window) = current
+                .iter()
+                .find(|window| window.id == window_id && window.native_handle == handle)
+            else {
+                errors.push(format!(
+                    "Window '{window_id}' disappeared; refresh and rebind it."
+                ));
+                continue;
+            };
+            let hwnd = HWND(handle as *mut core::ffi::c_void);
+            let result = match action {
+                WindowAction::SetVisible {
+                    visible,
+                    force_popup,
+                    ..
+                } => unsafe {
+                    if visible {
+                        if force_popup {
+                            // Place above normal windows without activating or changing display mode.
+                            SetWindowPos(
+                                hwnd,
+                                HWND_TOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE
+                                    | SWP_NOSIZE
+                                    | SWP_NOACTIVATE
+                                    | SWP_SHOWWINDOW
+                                    | SWP_NOOWNERZORDER,
+                            )
+                            .map_err(|e| e.to_string())
+                        } else {
+                            // Do not touch z-order for the default game-friendly path.
+                            let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+                            Ok(())
+                        }
+                    } else {
+                        if force_popup {
+                            let _ = SetWindowPos(
+                                hwnd,
+                                HWND_NOTOPMOST,
+                                0,
+                                0,
+                                0,
+                                0,
+                                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
+                            );
+                        }
+                        let _ = ShowWindowAsync(hwnd, SW_HIDE);
+                        Ok(())
+                    }
+                },
+                WindowAction::SetRect { rect, .. } => {
+                    if window.rect == rect {
+                        Ok(())
+                    } else {
+                        unsafe {
+                            SetWindowPos(
+                                hwnd,
+                                None,
+                                rect.x,
+                                rect.y,
+                                rect.width,
+                                rect.height,
+                                SWP_NOZORDER | SWP_NOACTIVATE,
+                            )
+                            .map_err(|e| e.to_string())
+                        }
+                    }
+                }
+            };
+            if let Err(error) = result {
+                errors.push(format!("{}: {error}", window.title));
             }
-        })
+        }
+        // When hiding windows behind a game, restore the already-focused foreground app only
+        // if Windows transferred focus as a side effect. Never activate a VeilKey group window.
+        if hiding
+            && !foreground_before.0.is_null()
+            && !hidden_handles.contains(&(foreground_before.0 as isize))
+        {
+            unsafe {
+                if IsWindow(foreground_before).as_bool()
+                    && GetForegroundWindow() != foreground_before
+                {
+                    let _ = SetForegroundWindow(foreground_before);
+                }
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Some group window actions failed: {}",
+                errors.join("; ")
+            ))
+        }
     }
 }
 

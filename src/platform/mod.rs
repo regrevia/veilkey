@@ -14,6 +14,12 @@ impl NativeWindowController {
     pub fn enumerate() -> Result<Vec<crate::WindowInfo>, String> {
         Ok(Vec::new())
     }
+    pub fn apply_actions(actions: Vec<crate::WindowAction>) -> Result<(), String> {
+        for action in actions {
+            Self::apply(action)?;
+        }
+        Ok(())
+    }
     pub fn apply(_action: crate::WindowAction) -> Result<(), String> {
         Err("VeilKey currently supports Windows and macOS only".into())
     }

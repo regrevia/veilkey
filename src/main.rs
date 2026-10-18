@@ -137,11 +137,8 @@ impl VeilKeyApp {
     }
 
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
-        for action in actions {
-            if let Err(error) = NativeWindowController::apply(action) {
-                self.state.status = error;
-                break;
-            }
+        if let Err(error) = NativeWindowController::apply_actions(actions) {
+            self.state.status = error;
         }
     }
 

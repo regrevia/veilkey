@@ -1,0 +1,22 @@
+main:
+  push:
+    - name: windows-check
+      runner:
+        tags:
+          - windows
+          - amd64
+      stages:
+        - name: check
+          script: cargo check --all-targets
+    - name: macos-arm64-check
+      lock:
+        key: veilkey-macos-arm64
+        cancel-in-progress: true
+      runner:
+        namespace: group
+        tags:
+          - mac
+          - arm64
+      stages:
+        - name: check
+          script: cargo check --all-targets

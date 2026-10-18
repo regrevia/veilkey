@@ -1,27 +1,30 @@
 # VeilKey
 
-VeilKey is a cross-platform desktop utility for grouping windows and showing or hiding a group with one keyboard shortcut. A group keeps each window's original position and size so it can return to the same workspace arrangement.
+VeilKey is a small desktop utility for binding several application windows into a named group and showing or hiding that group with one global keyboard shortcut. It aims to restore each window to its saved position and size when shown again.
 
-This is a clean-room project. It is independently designed and implemented; the earlier project is used only as a product concept reference.
+This is an independent clean-room project. The earlier project informed only the general product idea; no source code, artwork, or documentation was carried over.
 
-## Project status
+## Current status
 
-Early development. The repository currently contains the project scaffold. Windows and macOS window discovery, grouping, shortcut capture, persistence, and recovery behavior are planned as platform adapters behind a shared core.
+VeilKey is in early development. The current build includes a basic group manager, window discovery, per-group shortcuts, and persistent settings on Windows and macOS. Select the windows in the list, enter a group name, and create the group. Enter a shortcut such as `ctrl+alt+KeyH` or `super+shift+KeyH` in that group's Shortcut field, then choose **Bind**. A shortcut already registered by another application may be unavailable.
 
-## Design goals
+On macOS, grant VeilKey permission under **System Settings → Privacy & Security → Accessibility**. Window discovery and control depend on that permission. On Windows, windows must expose a title and a usable top-level window handle to be listed and controlled.
 
-- Explicitly bind selected windows into named groups; keep the focused-window binding as a quick path.
-- Toggle the entire group atomically and restore each window's prior visibility and geometry.
-- Persist group state safely and reconcile stale window handles after restart.
-- Keep global shortcut registration observable and recover from registration loss.
-- Use native platform APIs through isolated Windows and macOS adapters.
+The UI and native window adapters are still evolving. In particular, shortcut capture, automatic recovery after another application takes a shortcut, signed/notarized distribution, and long-duration testing on real desktops remain future work. Please report platform-specific issues with OS version and steps to reproduce.
 
 ## Build
 
-Requires Rust stable.
+Install the stable Rust toolchain, then run:
 
 ```sh
 cargo build --release
+```
+
+Run the test suite and compile checks with:
+
+```sh
+cargo test --all-targets
+cargo check --all-targets
 ```
 
 ## License

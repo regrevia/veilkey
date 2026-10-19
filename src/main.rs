@@ -32,6 +32,12 @@ fn localized_status(english: bool, status: &str) -> String {
         }
         "This shortcut is already assigned to the group." => "该快捷键已经绑定到此组。".into(),
         "Global shortcuts are unavailable on this system." => "当前系统无法启用全局快捷键。".into(),
+        _ if status.starts_with("Global key capture unavailable:") => {
+            format!(
+                "全局按键监听暂不可用，正在重试：{}",
+                status.trim_start_matches("Global key capture unavailable:")
+            )
+        }
         _ if status.starts_with("Could not register shortcut:") => {
             format!(
                 "快捷键注册失败：{}",
@@ -159,6 +165,7 @@ struct VeilKeyApp {
     recording_group: Option<usize>,
     settings_open: bool,
     capture_armed: Arc<AtomicBool>,
+    capture_listener_alive: Arc<AtomicBool>,
     capture_rx: Receiver<Result<String, String>>,
     pending_bind_group: Option<usize>,
 }
@@ -183,53 +190,68 @@ impl VeilKeyApp {
             }
         });
         let capture_armed = Arc::new(AtomicBool::new(false));
-        let listener_armed = Arc::clone(&capture_armed);
+        let listener_capture_armed = Arc::clone(&capture_armed);
+        let capture_listener_alive = Arc::new(AtomicBool::new(false));
+        let listener_alive = Arc::clone(&capture_listener_alive);
         let (capture_tx, capture_rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut down = HashSet::<rdev::Key>::new();
-            let callback_tx = capture_tx.clone();
-            let callback = move |event: rdev::Event| match event.event_type {
-                rdev::EventType::KeyPress(key) => {
-                    down.insert(key);
-                    if listener_armed.load(Ordering::Relaxed) && !is_modifier(key) {
-                        let ctrl = down.contains(&rdev::Key::ControlLeft)
-                            || down.contains(&rdev::Key::ControlRight);
-                        let alt =
-                            down.contains(&rdev::Key::Alt) || down.contains(&rdev::Key::AltGr);
-                        let shift = down.contains(&rdev::Key::ShiftLeft)
-                            || down.contains(&rdev::Key::ShiftRight);
-                        let super_key = down.contains(&rdev::Key::MetaLeft)
-                            || down.contains(&rdev::Key::MetaRight);
-                        if (ctrl || alt || shift || super_key)
-                            && let Some(key_name) = hotkey_key_name(key)
-                        {
-                            let mut parts = Vec::new();
-                            if ctrl {
-                                parts.push("ctrl");
-                            }
-                            if alt {
-                                parts.push("alt");
-                            }
-                            if shift {
-                                parts.push("shift");
-                            }
-                            if super_key {
-                                parts.push("super");
-                            }
-                            parts.push(key_name);
-                            if listener_armed.swap(false, Ordering::AcqRel) {
-                                let _ = callback_tx.send(Ok(parts.join("+")));
+            let mut error_reported = false;
+            loop {
+                let mut down = HashSet::<rdev::Key>::new();
+                let listener_armed = Arc::clone(&listener_capture_armed);
+                let callback_tx = capture_tx.clone();
+                listener_alive.store(true, Ordering::Release);
+                let callback = move |event: rdev::Event| match event.event_type {
+                    rdev::EventType::KeyPress(key) => {
+                        down.insert(key);
+                        if listener_armed.load(Ordering::Relaxed) && !is_modifier(key) {
+                            let ctrl = down.contains(&rdev::Key::ControlLeft)
+                                || down.contains(&rdev::Key::ControlRight);
+                            let alt =
+                                down.contains(&rdev::Key::Alt) || down.contains(&rdev::Key::AltGr);
+                            let shift = down.contains(&rdev::Key::ShiftLeft)
+                                || down.contains(&rdev::Key::ShiftRight);
+                            let super_key = down.contains(&rdev::Key::MetaLeft)
+                                || down.contains(&rdev::Key::MetaRight);
+                            if (ctrl || alt || shift || super_key)
+                                && let Some(key_name) = hotkey_key_name(key)
+                            {
+                                let mut parts = Vec::new();
+                                if ctrl {
+                                    parts.push("ctrl");
+                                }
+                                if alt {
+                                    parts.push("alt");
+                                }
+                                if shift {
+                                    parts.push("shift");
+                                }
+                                if super_key {
+                                    parts.push("super");
+                                }
+                                parts.push(key_name);
+                                if listener_armed.swap(false, Ordering::AcqRel) {
+                                    let _ = callback_tx.send(Ok(parts.join("+")));
+                                }
                             }
                         }
                     }
+                    rdev::EventType::KeyRelease(key) => {
+                        down.remove(&key);
+                    }
+                    _ => {}
+                };
+                let error = rdev::listen(callback)
+                    .err()
+                    .map(|error| format!("{error:?}"))
+                    .unwrap_or_else(|| "listener stopped unexpectedly".into());
+                listener_alive.store(false, Ordering::Release);
+                if !error_reported {
+                    let _ =
+                        capture_tx.send(Err(format!("Global key capture unavailable: {error}")));
+                    error_reported = true;
                 }
-                rdev::EventType::KeyRelease(key) => {
-                    down.remove(&key);
-                }
-                _ => {}
-            };
-            if let Err(error) = rdev::listen(callback) {
-                let _ = capture_tx.send(Err(format!("Global key capture unavailable: {error:?}")));
+                thread::sleep(Duration::from_secs(2));
             }
         });
         let hotkeys = GlobalHotKeyManager::new().ok();
@@ -247,6 +269,7 @@ impl VeilKeyApp {
             recording_group: None,
             settings_open: false,
             capture_armed,
+            capture_listener_alive,
             capture_rx,
             pending_bind_group: None,
         };
@@ -421,7 +444,6 @@ impl VeilKeyApp {
         };
         match captured {
             Err(error) => {
-                self.capture_armed.store(false, Ordering::Release);
                 self.state.status = error;
             }
             Ok(chord) => {
@@ -480,12 +502,21 @@ impl VeilKeyApp {
     fn arm_focused_window_binding(&mut self, english: bool) {
         self.pending_bind_group = None;
         self.capture_armed.store(true, Ordering::Release);
-        self.state.status = tr(
-            english,
-            "Focus the target window and press Ctrl/Alt/Shift/Win + a key.",
-            "切到目标窗口，按 Ctrl/Alt/Shift/Win + 任意键完成绑定。",
-        )
-        .into();
+        self.state.status = if self.capture_listener_alive.load(Ordering::Acquire) {
+            tr(
+                english,
+                "Focus the target window and press Ctrl/Alt/Shift/Win + a key.",
+                "切到目标窗口，按 Ctrl/Alt/Shift/Win + 任意键完成绑定。",
+            )
+            .into()
+        } else {
+            tr(
+                english,
+                "Keyboard listener is restarting; your binding will stay armed.",
+                "键盘监听正在恢复，绑定请求会保留，请稍后按下快捷键。",
+            )
+            .into()
+        };
     }
 
     fn capture_hotkey(&mut self, ctx: &egui::Context) {

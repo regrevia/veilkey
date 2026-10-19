@@ -1,3 +1,8 @@
+## 0.2.12 - 2026-10-19
+
+- Restart the global key capture listener with backoff after transient system or permission errors, keeping pending shortcut binding requests armed.
+- Show a localized recovery message when global keyboard capture is unavailable.
+
 ## 0.2.11 - 2026-10-19
 
 - Protect Windows window bindings against recycled native handles by including the owning process ID in new window identities.

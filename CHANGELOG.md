@@ -1,3 +1,8 @@
+## 0.2.18 - 2026-10-19
+
+- Report every global key listener failure instead of suppressing all failures after the first incident.
+- Reset the listener retry backoff after five minutes of stable operation so a later isolated failure recovers quickly.
+
 ## 0.2.17 - 2026-10-19
 
 - Run native window group operations off the UI thread and serialize rapid shortcut toggles against fresh window snapshots.

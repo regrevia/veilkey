@@ -64,6 +64,14 @@ fn capture_retry_delay(failures: u32) -> Duration {
         .min(Duration::from_secs(60))
 }
 
+fn capture_retry_delay_after_failure(failures: &mut u32, listener_uptime: Duration) -> Duration {
+    if listener_uptime >= Duration::from_secs(300) {
+        *failures = 0;
+    }
+    *failures = failures.saturating_add(1);
+    capture_retry_delay(*failures)
+}
+
 fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
     let _ = sender.try_send(());
 }
@@ -247,7 +255,6 @@ impl VeilKeyApp {
         let listener_alive = Arc::clone(&capture_listener_alive);
         let (capture_tx, capture_rx) = mpsc::channel();
         thread::spawn(move || {
-            let mut error_reported = false;
             let mut failures = 0_u32;
             loop {
                 let mut down = HashSet::<rdev::Key>::new();
@@ -294,18 +301,16 @@ impl VeilKeyApp {
                     }
                     _ => {}
                 };
+                let attempt_started = Instant::now();
                 let error = rdev::listen(callback)
                     .err()
                     .map(|error| format!("{error:?}"))
                     .unwrap_or_else(|| "listener stopped unexpectedly".into());
                 listener_alive.store(false, Ordering::Release);
-                failures = failures.saturating_add(1);
-                if !error_reported {
-                    let _ =
-                        capture_tx.send(Err(format!("Global key capture unavailable: {error}")));
-                    error_reported = true;
-                }
-                thread::sleep(capture_retry_delay(failures));
+                let _ = capture_tx.send(Err(format!("Global key capture unavailable: {error}")));
+                let delay =
+                    capture_retry_delay_after_failure(&mut failures, attempt_started.elapsed());
+                thread::sleep(delay);
             }
         });
         let hotkeys = GlobalHotKeyManager::new().ok();
@@ -531,6 +536,9 @@ impl VeilKeyApp {
         match captured {
             Err(error) => {
                 self.state.status = error;
+                // Ensure a quick fail/restart cycle still produces a visible
+                // recovered status even if the UI missed the brief false state.
+                self.capture_listener_was_alive = false;
             }
             Ok(chord) => {
                 self.capture_armed.store(false, Ordering::Release);
@@ -1135,6 +1143,17 @@ mod tests {
         assert_eq!(capture_retry_delay(3), Duration::from_secs(8));
         assert_eq!(capture_retry_delay(6), Duration::from_secs(60));
         assert_eq!(capture_retry_delay(20), Duration::from_secs(60));
+        let mut failures = 8;
+        assert_eq!(
+            capture_retry_delay_after_failure(&mut failures, Duration::from_secs(299)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(failures, 9);
+        assert_eq!(
+            capture_retry_delay_after_failure(&mut failures, Duration::from_secs(300)),
+            Duration::from_secs(2)
+        );
+        assert_eq!(failures, 1);
     }
 
     #[test]

@@ -1,3 +1,7 @@
+## 0.2.25 - 2026-10-19
+
+- Recover mixed-visibility groups toward the last requested state after partial native window failures, and avoid moving windows that are already visible when restoring a group.
+
 ## 0.2.24 - 2026-10-19
 
 - Add an optional macOS group mode that hides the owning apps instead of minimizing their windows, avoiding minimized-window tiles in the Dock. The mode explicitly affects every window belonging to each app and leaves its Dock icon visible.

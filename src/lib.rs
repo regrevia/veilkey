@@ -124,7 +124,20 @@ impl AppState {
             .iter()
             .filter_map(|id| find_window(id))
             .any(|window| window.visible);
-        if any_visible {
+        let any_hidden = group
+            .window_ids
+            .iter()
+            .filter_map(|id| find_window(id))
+            .any(|window| !window.visible);
+        // Native window operations can partially succeed. In a mixed state,
+        // honor the last requested target so the next shortcut converges the
+        // whole group instead of merely repeating the action on visible windows.
+        let should_hide = if any_visible && any_hidden {
+            group.is_visible
+        } else {
+            any_visible
+        };
+        if should_hide {
             for id in &group.window_ids {
                 if let Some(window) = find_window(id).filter(|w| w.visible) {
                     group.restore_rects.insert(id.clone(), window.rect);
@@ -140,7 +153,7 @@ impl AppState {
             group.is_visible = false;
         } else {
             for id in &group.window_ids {
-                if let Some(window) = find_window(id) {
+                if let Some(window) = find_window(id).filter(|window| !window.visible) {
                     if !group.macos_hide_application
                         && let Some(rect) = group.restore_rects.get(id)
                     {
@@ -435,10 +448,7 @@ mod tests {
         state.selected_windows.extend(["a".into(), "b".into()]);
         assert!(state.create_group("MuMu set".into()));
 
-        let initially_visible = [sample_window("a", 1, 10), sample_window("b", 2, 900)];
-        state.toggle_group(0, &initially_visible);
-
-        // Window a hid successfully; b stayed visible and was moved before retry.
+        // The saved state says shown, but a is already hidden and b has moved.
         let partially_hidden = [
             WindowInfo {
                 visible: false,
@@ -469,8 +479,39 @@ mod tests {
             })
             .collect();
 
-        assert_eq!(restored_rects.get("a").map(|rect| rect.x), Some(10));
+        assert_eq!(restored_rects.get("a").map(|rect| rect.x), None);
         assert_eq!(restored_rects.get("b").map(|rect| rect.x), Some(1200));
+    }
+
+    #[test]
+    fn mixed_visibility_toggle_recovers_toward_last_requested_group_state() {
+        let mut state = AppState::default();
+        state.selected_windows.extend(["a".into(), "b".into()]);
+        assert!(state.create_group("MuMu set".into()));
+        state.toggle_group(0, &[sample_window("a", 1, 10), sample_window("b", 2, 900)]);
+
+        // Hiding only succeeded for a. The next toggle should show a, while
+        // leaving b at its current position instead of moving it to its old one.
+        let mixed = [
+            WindowInfo {
+                visible: false,
+                ..sample_window("a", 1, 10)
+            },
+            sample_window("b", 2, 1200),
+        ];
+        let actions = state.toggle_group(0, &mixed);
+        assert_eq!(actions.len(), 2);
+        assert!(matches!(
+            actions[0],
+            WindowAction::SetRect { ref window_id, rect, .. }
+                if window_id == "a" && rect.x == 10
+        ));
+        assert!(matches!(
+            actions[1],
+            WindowAction::SetVisible { ref window_id, visible: true, .. }
+                if window_id == "a"
+        ));
+        assert!(state.groups[0].is_visible);
     }
 
     #[test]

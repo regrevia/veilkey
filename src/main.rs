@@ -26,6 +26,7 @@ fn localized_status(english: bool, status: &str) -> String {
         "Shortcut registered." => "快捷键已绑定。".into(),
         "Window state recovered after a brief retry." => "窗口状态已自动恢复。".into(),
         "Shortcuts recovered." => "快捷键已恢复。".into(),
+        "Keyboard listener recovered." => "全局按键监听已恢复。".into(),
         "Press the shortcut now." => "请按下要绑定的快捷键。".into(),
         "That shortcut is already assigned to another group." => {
             "这个快捷键已分配给其他窗口组。".into()
@@ -52,6 +53,11 @@ fn localized_status(english: bool, status: &str) -> String {
         }
         _ => status.to_owned(),
     }
+}
+
+fn capture_retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(2_u64.saturating_mul(1_u64 << failures.saturating_sub(1).min(5)))
+        .min(Duration::from_secs(60))
 }
 
 fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(String, HotKey)> {
@@ -166,6 +172,7 @@ struct VeilKeyApp {
     settings_open: bool,
     capture_armed: Arc<AtomicBool>,
     capture_listener_alive: Arc<AtomicBool>,
+    capture_listener_was_alive: bool,
     capture_rx: Receiver<Result<String, String>>,
     pending_bind_group: Option<usize>,
 }
@@ -196,6 +203,7 @@ impl VeilKeyApp {
         let (capture_tx, capture_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut error_reported = false;
+            let mut failures = 0_u32;
             loop {
                 let mut down = HashSet::<rdev::Key>::new();
                 let listener_armed = Arc::clone(&listener_capture_armed);
@@ -246,12 +254,13 @@ impl VeilKeyApp {
                     .map(|error| format!("{error:?}"))
                     .unwrap_or_else(|| "listener stopped unexpectedly".into());
                 listener_alive.store(false, Ordering::Release);
+                failures = failures.saturating_add(1);
                 if !error_reported {
                     let _ =
                         capture_tx.send(Err(format!("Global key capture unavailable: {error}")));
                     error_reported = true;
                 }
-                thread::sleep(Duration::from_secs(2));
+                thread::sleep(capture_retry_delay(failures));
             }
         });
         let hotkeys = GlobalHotKeyManager::new().ok();
@@ -270,6 +279,7 @@ impl VeilKeyApp {
             settings_open: false,
             capture_armed,
             capture_listener_alive,
+            capture_listener_was_alive: false,
             capture_rx,
             pending_bind_group: None,
         };
@@ -622,11 +632,26 @@ impl VeilKeyApp {
             }
         }
     }
+
+    fn update_capture_listener_status(&mut self) {
+        let alive = self.capture_listener_alive.load(Ordering::Acquire);
+        if alive
+            && !self.capture_listener_was_alive
+            && self
+                .state
+                .status
+                .starts_with("Global key capture unavailable:")
+        {
+            self.state.status = "Keyboard listener recovered.".into();
+        }
+        self.capture_listener_was_alive = alive;
+    }
 }
 
 impl eframe::App for VeilKeyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_window_snapshot();
+        self.update_capture_listener_status();
         self.retry_hotkeys_if_needed();
         self.process_global_binding_capture(self.state.english_ui);
         self.capture_hotkey(ctx);
@@ -1007,5 +1032,15 @@ mod tests {
         let pending = pending_hotkeys(&groups, &HashSet::from([active.id]));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, "Needs retry");
+    }
+
+    #[test]
+    fn capture_listener_retry_uses_capped_exponential_backoff() {
+        assert_eq!(capture_retry_delay(0), Duration::from_secs(2));
+        assert_eq!(capture_retry_delay(1), Duration::from_secs(2));
+        assert_eq!(capture_retry_delay(2), Duration::from_secs(4));
+        assert_eq!(capture_retry_delay(3), Duration::from_secs(8));
+        assert_eq!(capture_retry_delay(6), Duration::from_secs(60));
+        assert_eq!(capture_retry_delay(20), Duration::from_secs(60));
     }
 }

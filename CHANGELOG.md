@@ -1,3 +1,8 @@
+## 0.2.13 - 2026-10-19
+
+- Back off global key capture retries exponentially up to 60 seconds instead of retrying every 2 seconds during prolonged permission or system failures.
+- Clear stale listener errors and report when global key capture recovers.
+
 ## 0.2.12 - 2026-10-19
 
 - Restart the global key capture listener with backoff after transient system or permission errors, keeping pending shortcut binding requests armed.

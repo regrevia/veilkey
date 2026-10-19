@@ -4,6 +4,7 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::fs::File;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -56,6 +57,12 @@ fn localized_status(english: bool, status: &str) -> String {
                 status.trim_start_matches("Some group window actions failed:")
             )
         }
+        _ if status.starts_with("Window operation failed unexpectedly:") => {
+            format!(
+                "窗口操作遇到意外错误，服务已恢复：{}",
+                status.trim_start_matches("Window operation failed unexpectedly:")
+            )
+        }
         _ => status.to_owned(),
     }
 }
@@ -79,6 +86,56 @@ fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
 
 fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
     snapshot_generation == current_generation && current_generation.is_multiple_of(2)
+}
+
+struct OperationGenerationGuard<'a> {
+    generation: &'a AtomicU64,
+    active: bool,
+}
+
+impl<'a> OperationGenerationGuard<'a> {
+    fn begin(generation: &'a AtomicU64) -> Self {
+        generation.fetch_add(1, Ordering::AcqRel);
+        Self {
+            generation,
+            active: true,
+        }
+    }
+
+    fn finish(mut self) -> u64 {
+        self.active = false;
+        self.generation.fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
+impl Drop for OperationGenerationGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+}
+
+fn run_protected_window_operation<F>(generation: &AtomicU64, operation: F) -> ActionCompletion
+where
+    F: FnOnce() -> (Result<(), String>, Result<Vec<WindowInfo>, String>),
+{
+    let generation_guard = OperationGenerationGuard::begin(generation);
+    let (applied, snapshot) = match catch_unwind(AssertUnwindSafe(operation)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unexpected panic");
+            (
+                Err(format!("Window operation failed unexpectedly: {detail}")),
+                Err("Window snapshot was skipped after an unexpected operation failure.".into()),
+            )
+        }
+    };
+    (generation_guard.finish(), applied, snapshot)
 }
 
 fn enqueue_toggle<T: PartialEq>(queue: &mut VecDeque<T>, value: T, capacity: usize) -> bool {
@@ -261,21 +318,19 @@ impl VeilKeyApp {
             while let Ok(actions) = action_requests.recv() {
                 // Odd generations mean a native operation is in progress. Any
                 // concurrent enumeration is discarded, even if it returns late.
-                action_generation.fetch_add(1, Ordering::AcqRel);
-                let retry = actions.clone();
-                let applied = match NativeWindowController::apply_actions(actions) {
-                    Ok(()) => Ok(()),
-                    Err(first) => match NativeWindowController::apply_actions(retry) {
+                let completion = run_protected_window_operation(&action_generation, || {
+                    let retry = actions.clone();
+                    let applied = match NativeWindowController::apply_actions(actions) {
                         Ok(()) => Ok(()),
-                        Err(second) => Err(format!("{first}; retry failed: {second}")),
-                    },
-                };
-                let snapshot = NativeWindowController::enumerate();
-                let generation = action_generation.fetch_add(1, Ordering::AcqRel) + 1;
-                if action_results
-                    .send((generation, applied, snapshot))
-                    .is_err()
-                {
+                        Err(first) => match NativeWindowController::apply_actions(retry) {
+                            Ok(()) => Ok(()),
+                            Err(second) => Err(format!("{first}; retry failed: {second}")),
+                        },
+                    };
+                    let snapshot = NativeWindowController::enumerate();
+                    (applied, snapshot)
+                });
+                if action_results.send(completion).is_err() {
                     break;
                 }
             }
@@ -1323,6 +1378,18 @@ mod tests {
         assert!(!snapshot_is_current(3, 3));
         assert!(!snapshot_is_current(2, 4));
         assert!(!snapshot_is_current(4, 5));
+    }
+
+    #[test]
+    fn panicking_window_operation_recovers_snapshot_generation_and_returns_error() {
+        let generation = AtomicU64::new(0);
+        let (generation, applied, snapshot) =
+            run_protected_window_operation(&generation, || panic!("simulated worker fault"));
+
+        assert_eq!(generation, 2);
+        assert!(snapshot_is_current(generation, generation));
+        assert!(applied.unwrap_err().contains("simulated worker fault"));
+        assert!(snapshot.is_err());
     }
 
     #[test]

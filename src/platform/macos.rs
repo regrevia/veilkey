@@ -1,13 +1,13 @@
 use crate::{Rect, WindowAction, WindowInfo};
 use accessibility_sys::{
     AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
-    AXUIElementRef, AXUIElementSetAttributeValue, AXUIElementSetMessagingTimeout, AXValueCreate,
-    AXValueGetValue, kAXErrorSuccess, kAXMinimizedAttribute, kAXPositionAttribute,
-    kAXSizeAttribute, kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXWindowsAttribute,
+    AXUIElementCreateSystemWide, AXUIElementRef, AXUIElementSetAttributeValue,
+    AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue, kAXErrorSuccess,
+    kAXFocusedWindowAttribute, kAXMinimizedAttribute, kAXPositionAttribute, kAXSizeAttribute,
+    kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
 };
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation_sys::base::{CFRelease, CFRetain, CFTypeRef, kCFAllocatorDefault};
+use core_foundation_sys::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, kCFAllocatorDefault};
 use core_foundation_sys::number::{
     CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef, kCFBooleanFalse, kCFBooleanTrue,
 };
@@ -42,6 +42,44 @@ struct RawWindow {
 pub struct NativeWindowController;
 
 impl NativeWindowController {
+    pub fn foreground_window_id() -> Result<Option<String>, String> {
+        if !unsafe { AXIsProcessTrusted() } {
+            return Err(
+                "Enable VeilKey in Accessibility settings before binding a focused window.".into(),
+            );
+        }
+        let system = unsafe { AXUIElementCreateSystemWide() };
+        if system.is_null() {
+            return Ok(None);
+        }
+        let focused = copy_value(system, kAXFocusedWindowAttribute);
+        unsafe { CFRelease(system as CFTypeRef) };
+        let Some(focused) = focused else {
+            return Ok(None);
+        };
+        let raw = collect_windows()?;
+        let mut counts = BTreeMap::<(String, String), usize>::new();
+        let mut found = None;
+        for window in &raw {
+            let key = (window.app.to_lowercase(), window.title.clone());
+            let ordinal = counts.entry(key.clone()).or_default();
+            if unsafe { CFEqual(focused, window.element as CFTypeRef) } != 0 {
+                found = Some(format!(
+                    "{}\0{}\0{}\0pid:{}",
+                    key.0, key.1, *ordinal, window.pid
+                ));
+            }
+            *ordinal += 1;
+        }
+        unsafe {
+            CFRelease(focused);
+            for window in raw {
+                CFRelease(window.element as CFTypeRef);
+            }
+        }
+        Ok(found)
+    }
+
     pub fn enumerate() -> Result<Vec<WindowInfo>, String> {
         let raw = collect_windows()?;
         let mut counts = BTreeMap::<(String, String), usize>::new();

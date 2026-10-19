@@ -11,6 +11,9 @@ pub use windows::NativeWindowController;
 pub struct NativeWindowController;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 impl NativeWindowController {
+    pub fn foreground_window_id() -> Result<Option<String>, String> {
+        Ok(None)
+    }
     pub fn enumerate() -> Result<Vec<crate::WindowInfo>, String> {
         Ok(Vec::new())
     }

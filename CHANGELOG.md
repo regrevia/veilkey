@@ -1,3 +1,9 @@
+## 0.2.9 - 2026-10-19
+
+- Bind the focused foreground window directly by pressing a global shortcut combination.
+- Allow one-window-at-a-time binding to capture its shortcut while that target window is focused.
+- Document global key capture permissions and clarify that window thumbnails are not yet available.
+
 ## 0.2.8 - 2026-10-19
 
 - Complete Chinese/English UI text and localized status messages.

@@ -23,6 +23,17 @@ struct RawWindow {
 pub struct NativeWindowController;
 
 impl NativeWindowController {
+    pub fn foreground_window_id() -> Result<Option<String>, String> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if foreground.0.is_null() {
+            return Ok(None);
+        }
+        Ok(Self::enumerate()?
+            .into_iter()
+            .find(|window| window.native_handle == foreground.0 as isize)
+            .map(|window| window.id))
+    }
+
     pub fn enumerate() -> Result<Vec<WindowInfo>, String> {
         let mut raw = Vec::<RawWindow>::new();
         unsafe extern "system" fn collect(hwnd: HWND, state: LPARAM) -> BOOL {
@@ -48,6 +59,9 @@ impl NativeWindowController {
                 }
                 let mut pid = 0u32;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
+                if pid == std::process::id() {
+                    return BOOL(1);
+                }
                 let app = process_name(pid);
                 raw.push(RawWindow {
                     hwnd,

@@ -1,7 +1,10 @@
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use std::collections::HashSet;
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -45,6 +48,92 @@ fn localized_status(english: bool, status: &str) -> String {
     }
 }
 
+fn is_modifier(key: rdev::Key) -> bool {
+    matches!(
+        key,
+        rdev::Key::ControlLeft
+            | rdev::Key::ControlRight
+            | rdev::Key::Alt
+            | rdev::Key::AltGr
+            | rdev::Key::ShiftLeft
+            | rdev::Key::ShiftRight
+            | rdev::Key::MetaLeft
+            | rdev::Key::MetaRight
+    )
+}
+
+fn hotkey_key_name(key: rdev::Key) -> Option<&'static str> {
+    use rdev::Key::*;
+    Some(match key {
+        KeyA => "KeyA",
+        KeyB => "KeyB",
+        KeyC => "KeyC",
+        KeyD => "KeyD",
+        KeyE => "KeyE",
+        KeyF => "KeyF",
+        KeyG => "KeyG",
+        KeyH => "KeyH",
+        KeyI => "KeyI",
+        KeyJ => "KeyJ",
+        KeyK => "KeyK",
+        KeyL => "KeyL",
+        KeyM => "KeyM",
+        KeyN => "KeyN",
+        KeyO => "KeyO",
+        KeyP => "KeyP",
+        KeyQ => "KeyQ",
+        KeyR => "KeyR",
+        KeyS => "KeyS",
+        KeyT => "KeyT",
+        KeyU => "KeyU",
+        KeyV => "KeyV",
+        KeyW => "KeyW",
+        KeyX => "KeyX",
+        KeyY => "KeyY",
+        KeyZ => "KeyZ",
+        Num0 => "Digit0",
+        Num1 => "Digit1",
+        Num2 => "Digit2",
+        Num3 => "Digit3",
+        Num4 => "Digit4",
+        Num5 => "Digit5",
+        Num6 => "Digit6",
+        Num7 => "Digit7",
+        Num8 => "Digit8",
+        Num9 => "Digit9",
+        F1 => "F1",
+        F2 => "F2",
+        F3 => "F3",
+        F4 => "F4",
+        F5 => "F5",
+        F6 => "F6",
+        F7 => "F7",
+        F8 => "F8",
+        F9 => "F9",
+        F10 => "F10",
+        F11 => "F11",
+        F12 => "F12",
+        Space => "Space",
+        Tab => "Tab",
+        Return => "Enter",
+        Escape => "Escape",
+        Backspace => "Backspace",
+        Delete => "Delete",
+        Home => "Home",
+        End => "End",
+        PageUp => "PageUp",
+        PageDown => "PageDown",
+        LeftArrow => "ArrowLeft",
+        RightArrow => "ArrowRight",
+        UpArrow => "ArrowUp",
+        DownArrow => "ArrowDown",
+        Minus => "Minus",
+        Equal => "Equal",
+        BackQuote => "Backquote",
+        _ => return None,
+    })
+}
+
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
@@ -57,6 +146,9 @@ struct VeilKeyApp {
     last_hotkey_retry: Instant,
     recording_group: Option<usize>,
     settings_open: bool,
+    capture_armed: Arc<AtomicBool>,
+    capture_rx: Receiver<Result<String, String>>,
+    pending_bind_group: Option<usize>,
 }
 
 impl VeilKeyApp {
@@ -78,6 +170,56 @@ impl VeilKeyApp {
                 }
             }
         });
+        let capture_armed = Arc::new(AtomicBool::new(false));
+        let listener_armed = Arc::clone(&capture_armed);
+        let (capture_tx, capture_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut down = HashSet::<rdev::Key>::new();
+            let callback_tx = capture_tx.clone();
+            let callback = move |event: rdev::Event| match event.event_type {
+                rdev::EventType::KeyPress(key) => {
+                    down.insert(key);
+                    if listener_armed.load(Ordering::Relaxed) && !is_modifier(key) {
+                        let ctrl = down.contains(&rdev::Key::ControlLeft)
+                            || down.contains(&rdev::Key::ControlRight);
+                        let alt =
+                            down.contains(&rdev::Key::Alt) || down.contains(&rdev::Key::AltGr);
+                        let shift = down.contains(&rdev::Key::ShiftLeft)
+                            || down.contains(&rdev::Key::ShiftRight);
+                        let super_key = down.contains(&rdev::Key::MetaLeft)
+                            || down.contains(&rdev::Key::MetaRight);
+                        if (ctrl || alt || shift || super_key)
+                            && let Some(key_name) = hotkey_key_name(key)
+                        {
+                            let mut parts = Vec::new();
+                            if ctrl {
+                                parts.push("ctrl");
+                            }
+                            if alt {
+                                parts.push("alt");
+                            }
+                            if shift {
+                                parts.push("shift");
+                            }
+                            if super_key {
+                                parts.push("super");
+                            }
+                            parts.push(key_name);
+                            if listener_armed.swap(false, Ordering::AcqRel) {
+                                let _ = callback_tx.send(Ok(parts.join("+")));
+                            }
+                        }
+                    }
+                }
+                rdev::EventType::KeyRelease(key) => {
+                    down.remove(&key);
+                }
+                _ => {}
+            };
+            if let Err(error) = rdev::listen(callback) {
+                let _ = capture_tx.send(Err(format!("Global key capture unavailable: {error:?}")));
+            }
+        });
         let hotkeys = GlobalHotKeyManager::new().ok();
         let mut app = Self {
             state,
@@ -91,6 +233,9 @@ impl VeilKeyApp {
             last_hotkey_retry: Instant::now(),
             recording_group: None,
             settings_open: false,
+            capture_armed,
+            capture_rx,
+            pending_bind_group: None,
         };
         app.register_saved_hotkeys();
         let _ = app.refresh_tx.send(());
@@ -232,6 +377,83 @@ impl VeilKeyApp {
         }
     }
 
+    fn process_global_binding_capture(&mut self, english: bool) {
+        let mut captured = None;
+        while let Ok(event) = self.capture_rx.try_recv() {
+            captured = Some(event);
+        }
+        let Some(captured) = captured else {
+            return;
+        };
+        match captured {
+            Err(error) => {
+                self.capture_armed.store(false, Ordering::Release);
+                self.state.status = error;
+            }
+            Ok(chord) => {
+                self.capture_armed.store(false, Ordering::Release);
+                let index = if let Some(index) = self.pending_bind_group.take() {
+                    Some(index)
+                } else {
+                    match NativeWindowController::foreground_window_id() {
+                        Ok(Some(window_id)) => {
+                            let fresh = NativeWindowController::enumerate().unwrap_or_default();
+                            if let Some(window) = fresh.iter().find(|window| window.id == window_id)
+                            {
+                                let mut name = window.title.clone();
+                                let mut suffix = 2;
+                                while self
+                                    .state
+                                    .groups
+                                    .iter()
+                                    .any(|group| group.name.eq_ignore_ascii_case(&name))
+                                {
+                                    name = format!("{} {suffix}", window.title);
+                                    suffix += 1;
+                                }
+                                self.state.selected_windows.insert(window.id.clone());
+                                if self.state.create_group(name) {
+                                    self.windows = fresh;
+                                    Some(self.state.groups.len() - 1)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            self.state.status = error;
+                            None
+                        }
+                    }
+                };
+                if let Some(index) = index {
+                    self.register_group_hotkey(index, chord);
+                } else if self.state.status.is_empty() {
+                    self.state.status = tr(
+                        english,
+                        "No eligible foreground window found.",
+                        "没有找到可绑定的前台窗口。",
+                    )
+                    .into();
+                }
+            }
+        }
+    }
+
+    fn arm_focused_window_binding(&mut self, english: bool) {
+        self.pending_bind_group = None;
+        self.capture_armed.store(true, Ordering::Release);
+        self.state.status = tr(
+            english,
+            "Focus the target window and press Ctrl/Alt/Shift/Win + a key.",
+            "切到目标窗口，按 Ctrl/Alt/Shift/Win + 任意键完成绑定。",
+        )
+        .into();
+    }
+
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
         let Some(index) = self.recording_group else {
             return;
@@ -341,6 +563,7 @@ impl eframe::App for VeilKeyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_window_snapshot();
         self.retry_hotkeys_if_needed();
+        self.process_global_binding_capture(self.state.english_ui);
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
         ctx.request_repaint_after(Duration::from_millis(100));
@@ -402,6 +625,12 @@ impl eframe::App for VeilKeyApp {
                     {
                         self.state.bind_mode = BindMode::OneWindowAtATime;
                         self.persist();
+                    }
+                    if ui
+                        .button(tr(english, "Bind focused window…", "绑定当前前台窗口…"))
+                        .clicked()
+                    {
+                        self.arm_focused_window_binding(english);
                     }
                     ui.label(tr(
                         english,
@@ -656,11 +885,13 @@ impl eframe::App for VeilKeyApp {
                     self.state.selected_windows.insert(window_id);
                     if self.state.create_group(name) {
                         let index = self.state.groups.len() - 1;
-                        self.recording_group = Some(index);
+                        self.recording_group = None;
+                        self.pending_bind_group = Some(index);
+                        self.capture_armed.store(true, Ordering::Release);
                         self.state.status = tr(
                             english,
-                            "Window added. Press its shortcut.",
-                            "窗口已添加，请按下快捷键。",
+                            "Focus that window and press its shortcut.",
+                            "切到该窗口并按下要绑定的快捷键。",
                         )
                         .into();
                         self.persist();

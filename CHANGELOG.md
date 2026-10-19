@@ -1,3 +1,7 @@
+## 0.2.15 - 2026-10-19
+
+- Bound and coalesce window refresh requests so slow Accessibility enumeration cannot accumulate an unbounded queue of redundant desktop scans.
+
 ## 0.2.14 - 2026-10-19
 
 - Enumerate macOS Accessibility windows once per group operation, avoiding repeated desktop-wide queries for each window and reducing toggle latency.

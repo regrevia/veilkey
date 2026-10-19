@@ -60,6 +60,10 @@ fn capture_retry_delay(failures: u32) -> Duration {
         .min(Duration::from_secs(60))
 }
 
+fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
+    let _ = sender.try_send(());
+}
+
 fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(String, HotKey)> {
     groups
         .iter()
@@ -161,7 +165,7 @@ struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
     window_rx: Receiver<Result<Vec<WindowInfo>, String>>,
-    refresh_tx: mpsc::Sender<()>,
+    refresh_tx: mpsc::SyncSender<()>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
     filter: String,
@@ -186,11 +190,12 @@ impl VeilKeyApp {
         }
         // A slow Accessibility query must never let stale snapshots accumulate.
         let (window_tx, window_rx) = mpsc::sync_channel(1);
-        let (refresh_tx, refresh_rx) = mpsc::channel();
+        let (refresh_tx, refresh_rx) = mpsc::sync_channel(1);
         thread::spawn(move || {
             while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
                 refresh_rx.recv_timeout(Duration::from_secs(2))
             {
+                while refresh_rx.try_recv().is_ok() {}
                 if window_tx.send(NativeWindowController::enumerate()).is_err() {
                     break;
                 }
@@ -284,7 +289,7 @@ impl VeilKeyApp {
             pending_bind_group: None,
         };
         app.register_saved_hotkeys();
-        let _ = app.refresh_tx.send(());
+        request_window_refresh(&app.refresh_tx);
         app
     }
 
@@ -400,7 +405,7 @@ impl VeilKeyApp {
         }
         // Native window managers may reject or asynchronously apply an operation.
         // A fresh snapshot keeps the next toggle based on observed OS state.
-        let _ = self.refresh_tx.send(());
+        request_window_refresh(&self.refresh_tx);
     }
 
     fn retry_hotkeys_if_needed(&mut self) {
@@ -682,7 +687,7 @@ impl eframe::App for VeilKeyApp {
                         self.settings_open = !self.settings_open;
                     }
                     if ui.button(tr(english, "Refresh", "刷新窗口")).clicked() {
-                        let _ = self.refresh_tx.send(());
+                        request_window_refresh(&self.refresh_tx);
                     }
                     ui.label(if english {
                         format!("{displayable_count} windows")
@@ -1042,5 +1047,15 @@ mod tests {
         assert_eq!(capture_retry_delay(3), Duration::from_secs(8));
         assert_eq!(capture_retry_delay(6), Duration::from_secs(60));
         assert_eq!(capture_retry_delay(20), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn window_refresh_requests_are_coalesced_when_the_worker_is_busy() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        request_window_refresh(&sender);
+        request_window_refresh(&sender);
+        request_window_refresh(&sender);
+        assert!(receiver.try_recv().is_ok());
+        assert!(receiver.try_recv().is_err());
     }
 }

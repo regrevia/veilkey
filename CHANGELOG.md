@@ -1,3 +1,7 @@
+## Unreleased
+
+- Keep processing Windows window groups and restoring the previously focused app when one forced z-order operation fails.
+
 ## 0.2.25 - 2026-10-19
 
 - Recover mixed-visibility groups toward the last requested state after partial native window failures, and avoid moving windows that are already visible when restoring a group.

@@ -182,16 +182,17 @@ impl NativeWindowController {
                                     | SWP_SHOWWINDOW
                                     | SWP_NOOWNERZORDER,
                             )
-                            .map_err(|e| e.to_string())?;
-                            wait_for_visibility(hwnd, true)
+                            .map_err(|e| e.to_string())
+                            .and_then(|()| wait_for_visibility(hwnd, true))
                         } else {
                             // Do not touch z-order for the default game-friendly path.
+                            // ShowWindowAsync returns the previous visibility state, not success.
                             let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
                             wait_for_visibility(hwnd, true)
                         }
                     } else {
-                        if force_popup {
-                            let _ = SetWindowPos(
+                        let z_order_result = if force_popup {
+                            SetWindowPos(
                                 hwnd,
                                 HWND_NOTOPMOST,
                                 0,
@@ -199,10 +200,20 @@ impl NativeWindowController {
                                 0,
                                 0,
                                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER,
-                            );
-                        }
+                            )
+                            .map_err(|e| e.to_string())
+                        } else {
+                            Ok(())
+                        };
+                        // ShowWindowAsync returns the previous visibility state, not success.
                         let _ = ShowWindowAsync(hwnd, SW_HIDE);
-                        wait_for_visibility(hwnd, false)
+                        let hide_result = wait_for_visibility(hwnd, false);
+                        match (z_order_result, hide_result) {
+                            (Ok(()), result) | (result, Ok(())) => result,
+                            (Err(z_order_error), Err(hide_error)) => Err(format!(
+                                "Could not restore normal z-order ({z_order_error}); hiding also failed ({hide_error})"
+                            )),
+                        }
                     }
                 },
                 WindowAction::SetRect { rect, .. } => {

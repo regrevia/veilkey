@@ -1,23 +1,23 @@
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
-use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::Arc;
-#[cfg(windows)]
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
 use veilkey::{
-    AppState, BindMode, Group, WindowAction, WindowInfo, acquire_instance_lock, load_state,
-    save_state, state_path, window_is_displayable,
+    AppState, BindMode, Group, WindowAction, WindowInfo, acquire_instance_lock, dynamic_target_ids,
+    load_state, save_state, state_path, window_is_displayable,
 };
+
+#[cfg(target_os = "windows")]
+mod windows_keyboard;
 
 fn tr<'a>(english: bool, en: &'a str, zh: &'a str) -> &'a str {
     if english { en } else { zh }
@@ -29,11 +29,14 @@ fn localized_status(english: bool, status: &str) -> String {
     }
     match status {
         "Shortcut registered." => "快捷键已绑定。".into(),
+        "Dynamic shortcut ranges registered." => "快捷键范围已生效。".into(),
+        "VeilKey was updated. Re-enable Accessibility and Screen Recording permissions." => {
+            "VeilKey 已更新并重置授权，请重新开启辅助功能和屏幕录制权限。".into()
+        }
         "Window state recovered after a brief retry." => "窗口状态已自动恢复。".into(),
         "Shortcuts recovered." => "快捷键已恢复。".into(),
         "Keyboard listener recovered." => "全局按键监听已恢复。".into(),
         "Window operation is already in progress." => "窗口操作正在执行，请稍候。".into(),
-        "Refreshing window state before toggling." => "正在刷新窗口状态，然后执行切换。".into(),
         "Window operation worker stopped." => "窗口操作服务已停止，请重启应用。".into(),
         "Too many window shortcuts are queued." => "窗口快捷键请求过多，部分请求已忽略。".into(),
         "Press the shortcut now." => "请按下要绑定的快捷键。".into(),
@@ -54,32 +57,87 @@ fn localized_status(english: bool, status: &str) -> String {
                 status.trim_start_matches("Could not register shortcut:")
             )
         }
+        _ if status.starts_with("Could not register shortcut range:") => format!(
+            "快捷键范围注册失败，已保留原配置：{}",
+            status.trim_start_matches("Could not register shortcut range:")
+        ),
         _ if status.starts_with("Some group window actions failed:") => {
             format!(
                 "部分窗口操作失败：{}",
                 status.trim_start_matches("Some group window actions failed:")
             )
         }
-        _ if status.starts_with("Window operation failed unexpectedly:") => {
-            format!(
-                "窗口操作遇到意外错误，服务已恢复：{}",
-                status.trim_start_matches("Window operation failed unexpectedly:")
-            )
-        }
-        _ if status.starts_with("Window enumeration failed unexpectedly:") => {
-            format!(
-                "窗口列表刷新遇到意外错误，正在稍后重试：{}",
-                status.trim_start_matches("Window enumeration failed unexpectedly:")
-            )
-        }
-        _ if status.starts_with("Focused window lookup failed unexpectedly:") => {
-            format!(
-                "识别前台窗口时遇到意外错误：{}",
-                status.trim_start_matches("Focused window lookup failed unexpectedly:")
-            )
-        }
         _ => status.to_owned(),
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+fn create_tray(
+    ctx: &egui::Context,
+) -> Result<(tray_icon::TrayIcon, Receiver<TrayCommand>, Arc<AtomicBool>), String> {
+    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
+
+    const SHOW_ID: &str = "veilkey.show";
+    const EXIT_ID: &str = "veilkey.exit";
+    let show = MenuItem::with_id(SHOW_ID, "打开 VeilKey", true, None);
+    let exit = MenuItem::with_id(EXIT_ID, "退出 VeilKey", true, None);
+    let menu = Menu::new();
+    menu.append_items(&[&show, &PredefinedMenuItem::separator(), &exit])
+        .map_err(|error| error.to_string())?;
+    let pixels = (0_i32..32)
+        .flat_map(|y| {
+            (0_i32..32).flat_map(move |x| {
+                let stroke = (5..27).contains(&y)
+                    && ((x - (7 + (y - 5) / 2)).abs() < 2 || (x - (25 - (y - 5) / 2)).abs() < 2);
+                [0, 0, 0, if stroke { 255 } else { 0 }]
+            })
+        })
+        .collect();
+    let icon = Icon::from_rgba(pixels, 32, 32).map_err(|error| error.to_string())?;
+    let builder = TrayIconBuilder::new().with_tooltip("VeilKey");
+    #[cfg(target_os = "macos")]
+    let builder = builder.with_icon_templated(icon);
+    #[cfg(target_os = "windows")]
+    let builder = builder.with_icon(icon);
+    let tray = builder
+        .with_menu(Box::new(menu))
+        .with_menu_on_left_click(false)
+        .build()
+        .map_err(|error| error.to_string())?;
+
+    let (sender, receiver) = mpsc::channel();
+    let menu_sender = sender.clone();
+    let menu_ctx = ctx.clone();
+    MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
+        let command = match event.id().as_ref() {
+            SHOW_ID => Some(TrayCommand::Show),
+            EXIT_ID => Some(TrayCommand::Exit),
+            _ => None,
+        };
+        if let Some(command) = command {
+            let _ = menu_sender.send(command);
+            menu_ctx.request_repaint();
+        }
+    }));
+    let tray_ctx = ctx.clone();
+    TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(
+            event,
+            TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left,
+                button_state: tray_icon::MouseButtonState::Up,
+                ..
+            } | TrayIconEvent::DoubleClick {
+                button: tray_icon::MouseButton::Left,
+                ..
+            }
+        ) {
+            let _ = sender.send(TrayCommand::Show);
+            tray_ctx.request_repaint();
+        }
+    }));
+    Ok((tray, receiver, Arc::new(AtomicBool::new(false))))
 }
 
 fn capture_retry_delay(failures: u32) -> Duration {
@@ -95,148 +153,8 @@ fn capture_retry_delay_after_failure(failures: &mut u32, listener_uptime: Durati
     capture_retry_delay(*failures)
 }
 
-fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
-    let _ = sender.try_send(());
-}
-
-struct NativeWindowLock {
-    #[cfg(windows)]
-    lock: Mutex<()>,
-}
-
-impl NativeWindowLock {
-    fn new() -> Self {
-        Self {
-            #[cfg(windows)]
-            lock: Mutex::new(()),
-        }
-    }
-}
-
-fn with_native_window_lock<T>(lock: &NativeWindowLock, operation: impl FnOnce() -> T) -> T {
-    #[cfg(windows)]
-    let _guard = lock
-        .lock
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    #[cfg(not(windows))]
-    let _ = lock;
-    operation()
-}
-
-fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
-    snapshot_generation == current_generation && current_generation.is_multiple_of(2)
-}
-
-fn snapshot_is_fresh(snapshot_updated_at: Option<Instant>, now: Instant) -> bool {
-    #[cfg(windows)]
-    {
-        snapshot_updated_at.is_some_and(|updated_at| {
-            now.saturating_duration_since(updated_at) <= Duration::from_millis(250)
-        })
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (snapshot_updated_at, now);
-        true
-    }
-}
-
-fn enumerate_windows_resiliently<F>(enumerate: F) -> Result<Vec<WindowInfo>, String>
-where
-    F: FnOnce() -> Result<Vec<WindowInfo>, String>,
-{
-    match catch_unwind(AssertUnwindSafe(enumerate)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let detail = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unexpected panic");
-            Err(format!("Window enumeration failed unexpectedly: {detail}"))
-        }
-    }
-}
-
-fn lookup_focused_window_resiliently<F>(
-    lookup: F,
-) -> (
-    Result<Option<String>, String>,
-    Result<Vec<WindowInfo>, String>,
-)
-where
-    F: FnOnce() -> (
-        Result<Option<String>, String>,
-        Result<Vec<WindowInfo>, String>,
-    ),
-{
-    match catch_unwind(AssertUnwindSafe(lookup)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let detail = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unexpected panic");
-            (
-                Err(format!(
-                    "Focused window lookup failed unexpectedly: {detail}"
-                )),
-                Err("Window enumeration was skipped after a focused-window lookup failure.".into()),
-            )
-        }
-    }
-}
-
-struct OperationGenerationGuard<'a> {
-    generation: &'a AtomicU64,
-    active: bool,
-}
-
-impl<'a> OperationGenerationGuard<'a> {
-    fn begin(generation: &'a AtomicU64) -> Self {
-        generation.fetch_add(1, Ordering::AcqRel);
-        Self {
-            generation,
-            active: true,
-        }
-    }
-
-    fn finish(mut self) -> u64 {
-        self.active = false;
-        self.generation.fetch_add(1, Ordering::AcqRel) + 1
-    }
-}
-
-impl Drop for OperationGenerationGuard<'_> {
-    fn drop(&mut self) {
-        if self.active {
-            self.generation.fetch_add(1, Ordering::AcqRel);
-        }
-    }
-}
-
-fn run_protected_window_operation<F>(generation: &AtomicU64, operation: F) -> ActionCompletion
-where
-    F: FnOnce() -> (Result<(), String>, Result<Vec<WindowInfo>, String>),
-{
-    let generation_guard = OperationGenerationGuard::begin(generation);
-    let (applied, snapshot) = match catch_unwind(AssertUnwindSafe(operation)) {
-        Ok(result) => result,
-        Err(payload) => {
-            let detail = payload
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| payload.downcast_ref::<&str>().copied())
-                .unwrap_or("unexpected panic");
-            (
-                Err(format!("Window operation failed unexpectedly: {detail}")),
-                Err("Window snapshot was skipped after an unexpected operation failure.".into()),
-            )
-        }
-    };
-    (generation_guard.finish(), applied, snapshot)
+fn request_window_refresh(sender: &mpsc::SyncSender<bool>, include_previews: bool) {
+    let _ = sender.try_send(include_previews);
 }
 
 fn enqueue_toggle<T: PartialEq>(queue: &mut VecDeque<T>, value: T, capacity: usize) -> bool {
@@ -262,22 +180,11 @@ fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(Stri
         .collect()
 }
 
-fn hotkey_registration_is_retryable(error: &global_hotkey::Error) -> bool {
-    matches!(
-        error,
-        global_hotkey::Error::AlreadyRegistered(_) | global_hotkey::Error::OsError(_)
-    )
-}
-
-fn hotkey_retry_delay(attempts: u32) -> Duration {
-    Duration::from_secs(5_u64.saturating_mul(1_u64 << attempts.min(6)))
-        .min(Duration::from_secs(300))
-}
-
 fn group_index_by_name(groups: &[Group], name: &str) -> Option<usize> {
     groups.iter().position(|group| group.name == name)
 }
 
+#[cfg(not(target_os = "windows"))]
 fn is_modifier(key: rdev::Key) -> bool {
     matches!(
         key,
@@ -292,6 +199,7 @@ fn is_modifier(key: rdev::Key) -> bool {
     )
 }
 
+#[cfg(not(target_os = "windows"))]
 fn hotkey_key_name(key: rdev::Key) -> Option<&'static str> {
     use rdev::Key::*;
     Some(match key {
@@ -367,21 +275,16 @@ fn hotkey_key_name(key: rdev::Key) -> Option<&'static str> {
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
-    snapshot_updated_at: Option<Instant>,
-    window_rx: Receiver<(u64, Result<Vec<WindowInfo>, String>)>,
-    snapshot_generation: Arc<AtomicU64>,
-    native_window_lock: Arc<NativeWindowLock>,
-    refresh_tx: mpsc::SyncSender<()>,
+    window_rx: Receiver<Result<Vec<WindowInfo>, String>>,
+    refresh_tx: mpsc::SyncSender<bool>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
     _instance_lock: File,
     filter: String,
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
-    hotkey_retry_attempts: u32,
     registered_hotkey_ids: HashSet<u32>,
     recording_group: Option<String>,
-    settings_open: bool,
     capture_armed: Arc<AtomicBool>,
     capture_listener_alive: Arc<AtomicBool>,
     capture_listener_was_alive: bool,
@@ -390,134 +293,466 @@ struct VeilKeyApp {
     focused_binding_tx: mpsc::Sender<FocusedBindingLookup>,
     focused_binding_in_flight: bool,
     pending_bind_group: Option<String>,
+    dynamic_toggle_rx: Receiver<DynamicToggleLookup>,
+    dynamic_toggle_tx: mpsc::Sender<DynamicToggleLookup>,
+    dynamic_toggle_in_flight: bool,
+    dynamic_hotkey_roles: HashMap<u32, DynamicHotkeyRole>,
+    dynamic_range_draft: AppState,
+    dynamic_suffix_input: String,
+    dynamic_config_error: String,
+    dynamic_recovery: Vec<Group>,
     action_tx: mpsc::SyncSender<Vec<WindowAction>>,
     action_rx: Receiver<ActionCompletion>,
     action_in_flight: bool,
     queued_toggles: VecDeque<String>,
-    waiting_toggles: VecDeque<String>,
+    preview_textures: HashMap<String, egui::TextureHandle>,
+    preview_pixels: HashMap<String, veilkey::WindowPreview>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    tray_icon: Option<tray_icon::TrayIcon>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    tray_events: Receiver<TrayCommand>,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    exit_requested: Arc<AtomicBool>,
 }
 
-type ActionCompletion = (u64, Result<(), String>, Result<Vec<WindowInfo>, String>);
+type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
 type FocusedBindingLookup = (
     String,
     Result<Option<String>, String>,
     Result<Vec<WindowInfo>, String>,
 );
+type DynamicToggleLookup = (
+    BindMode,
+    String,
+    Result<Option<String>, String>,
+    Result<Vec<WindowInfo>, String>,
+);
+
+#[derive(Clone)]
+struct DynamicHotkeyRole {
+    suffix: String,
+    hotkey: HotKey,
+}
+
+fn plan_dynamic_hotkeys(state: &AppState) -> Result<Vec<DynamicHotkeyRole>, String> {
+    if !state.bind_mode.is_dynamic() {
+        return Ok(Vec::new());
+    }
+    if state.dynamic_suffixes.is_empty() {
+        return Err("请至少选择一个可用按键。".into());
+    }
+    if state.dynamic_toggle_modifiers.is_empty()
+        || state
+            .dynamic_toggle_modifiers
+            .iter()
+            .any(|key| !["super", "ctrl", "alt", "shift"].contains(&key.as_str()))
+        || !state
+            .dynamic_toggle_modifiers
+            .iter()
+            .any(|key| key != "shift")
+    {
+        return Err("请至少允许 Command / Win、Control / Ctrl 或 Option / Alt 中的一项。".into());
+    }
+    let mut roles = Vec::new();
+    let mut ids = HashSet::new();
+    let mut suffixes = HashSet::new();
+    for suffix in &state.dynamic_suffixes {
+        if !suffixes.insert(suffix) || !available_suffixes().iter().any(|(key, _)| key == suffix) {
+            return Err(format!("无效或重复的按键：{suffix}"));
+        }
+    }
+    let modifiers = &state.dynamic_toggle_modifiers;
+    if modifiers.is_empty()
+        || modifiers
+            .iter()
+            .any(|key| !["ctrl", "alt", "shift", "super"].contains(&key.as_str()))
+    {
+        return Err("请选择有效的修饰键组合。".into());
+    }
+    for (suffix, chord) in state
+        .dynamic_suffixes
+        .iter()
+        .zip(veilkey::dynamic_hotkey_combinations(
+            modifiers,
+            &state.dynamic_suffixes,
+        ))
+    {
+        let hotkey = HotKey::from_str(&chord).map_err(|error| error.to_string())?;
+        if !ids.insert(hotkey.id) {
+            return Err("快捷键不能重复。".into());
+        }
+        if state.groups.iter().any(|group| {
+            group
+                .hotkey
+                .as_deref()
+                .and_then(|saved| HotKey::from_str(saved).ok())
+                .is_some_and(|saved| saved.id == hotkey.id)
+        }) {
+            return Err(format!("快捷键与窗口组合冲突：{chord}"));
+        }
+        roles.push(DynamicHotkeyRole {
+            suffix: suffix.clone(),
+            hotkey,
+        });
+    }
+    Ok(roles)
+}
+
+fn readable_chord(chord: &str, macos: bool) -> String {
+    let mut parts: Vec<_> = chord.split('+').map(str::to_owned).collect();
+    let suffix = parts.pop().unwrap_or_default();
+    readable_shortcut(&parts, &suffix, macos)
+}
+
+fn is_bound_in_session(group: &Group) -> bool {
+    !group.window_ids.is_empty()
+}
+
+fn available_suffixes() -> Vec<(String, String)> {
+    (0..=9)
+        .map(|n| (format!("Digit{n}"), n.to_string()))
+        .chain(('A'..='Z').map(|ch| (format!("Key{ch}"), ch.to_string())))
+        .chain((1..=12).map(|n| (format!("F{n}"), format!("F{n}"))))
+        .chain([("Minus".into(), "-".into()), ("Equal".into(), "=".into())])
+        .collect()
+}
+
+fn suffix_input(keys: &[String]) -> String {
+    let available = available_suffixes();
+    keys.iter()
+        .filter_map(|key| {
+            available
+                .iter()
+                .find(|(code, _)| code == key)
+                .map(|(code, label)| {
+                    if code.starts_with("Key") {
+                        label.to_ascii_lowercase()
+                    } else {
+                        label.clone()
+                    }
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn parse_suffix_input(input: &str) -> Result<Vec<String>, String> {
+    let available = available_suffixes();
+    let mut keys = Vec::new();
+    for token in input.split(|ch: char| ch.is_whitespace() || ch == ',' || ch == '，') {
+        if token.is_empty() {
+            continue;
+        }
+        let labels = if token
+            .get(..1)
+            .is_some_and(|first| first.eq_ignore_ascii_case("f"))
+            && token
+                .get(1..)
+                .is_some_and(|rest| rest.parse::<u8>().is_ok())
+        {
+            vec![token.to_ascii_uppercase()]
+        } else {
+            token
+                .chars()
+                .map(|ch| ch.to_ascii_uppercase().to_string())
+                .collect()
+        };
+        for label in labels {
+            let Some((code, _)) = available.iter().find(|(_, name)| name == &label) else {
+                return Err(format!("不支持的按键：{label}"));
+            };
+            if !keys.contains(code) {
+                keys.push(code.clone());
+            }
+        }
+    }
+    if keys.is_empty() {
+        return Err("请至少填写一个后缀键。".into());
+    }
+    Ok(keys)
+}
+
+fn readable_shortcut(modifiers: &[String], suffix: &str, macos: bool) -> String {
+    let mut parts = Vec::new();
+    for (key, label) in [
+        ("super", if macos { "Command" } else { "Win" }),
+        ("ctrl", if macos { "Control" } else { "Ctrl" }),
+        ("alt", if macos { "Option" } else { "Alt" }),
+        ("shift", "Shift"),
+    ] {
+        if modifiers.iter().any(|value| value == key) {
+            parts.push(label.to_owned());
+        }
+    }
+    let label = available_suffixes()
+        .into_iter()
+        .find(|(key, _)| key == suffix)
+        .map(|(key, label)| {
+            if key.starts_with("Key") {
+                label.to_ascii_lowercase()
+            } else {
+                label
+            }
+        })
+        .unwrap_or_else(|| suffix.to_owned());
+    parts.push(label);
+    parts.join(" + ")
+}
+
+fn slot_actions(group: &mut Group, windows: &[WindowInfo]) -> Vec<WindowAction> {
+    let mut state = AppState {
+        groups: vec![group.clone()],
+        ..Default::default()
+    };
+    let actions = state.toggle_group(0, windows);
+    *group = state.groups.remove(0);
+    actions
+}
+
+fn should_bind_slot(group: Option<&Group>, focused: Option<&str>, windows: &[WindowInfo]) -> bool {
+    let Some(group) = group.filter(|group| !group.window_ids.is_empty()) else {
+        return true;
+    };
+    if !group.window_ids.iter().any(|id| {
+        windows
+            .iter()
+            .any(|window| veilkey::same_window_id(&window.id, id))
+    }) {
+        return true;
+    }
+    if focused.is_some_and(|id| {
+        windows
+            .iter()
+            .any(|window| window.id == id && window.process_id == std::process::id())
+    }) {
+        return false;
+    }
+    // Hiding transfers focus elsewhere. The next press must restore this slot,
+    // rather than accidentally capturing whichever application received focus.
+    if !group.is_visible
+        || group.window_ids.iter().any(|id| {
+            windows
+                .iter()
+                .any(|window| veilkey::same_window_id(&window.id, id) && !window.visible)
+        })
+    {
+        return false;
+    }
+    focused.is_some_and(|focused| {
+        !group
+            .window_ids
+            .iter()
+            .any(|saved| veilkey::same_window_id(focused, saved))
+    })
+}
+
+fn restore_group_actions(group: &Group, windows: &[WindowInfo]) -> Vec<WindowAction> {
+    let mut actions = Vec::new();
+    for id in &group.window_ids {
+        if let Some(window) = windows
+            .iter()
+            .find(|window| veilkey::same_window_id(&window.id, id) && !window.visible)
+        {
+            if !group.macos_hide_application
+                && let Some(rect) = group.restore_rects.get(id)
+            {
+                actions.push(WindowAction::SetRect {
+                    window_id: id.clone(),
+                    handle: window.native_handle,
+                    rect: *rect,
+                });
+            }
+            actions.push(WindowAction::SetVisible {
+                window_id: id.clone(),
+                handle: window.native_handle,
+                visible: true,
+                force_popup: group.force_popup,
+                hide_application: group.macos_hide_application,
+            });
+        }
+    }
+    actions
+}
+
+fn restore_session_groups<'a>(
+    groups: impl Iterator<Item = &'a mut Group>,
+    windows: &[WindowInfo],
+) -> Vec<WindowAction> {
+    let mut actions = Vec::new();
+    for group in groups {
+        if !group.is_visible {
+            actions.extend(restore_group_actions(group, windows));
+            group.is_visible = true;
+        }
+    }
+    actions
+}
+
+fn retain_unrestored_targets(recovery: &mut Vec<Group>, windows: &[WindowInfo]) {
+    for group in recovery.iter_mut() {
+        group.window_ids.retain(|id| {
+            windows
+                .iter()
+                .any(|window| veilkey::same_window_id(&window.id, id) && !window.visible)
+        });
+    }
+    recovery.retain(|group| !group.window_ids.is_empty());
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+#[derive(Clone, Copy)]
+enum TrayCommand {
+    Show,
+    Exit,
+}
 
 impl VeilKeyApp {
-    fn new(instance_lock: File) -> Self {
+    fn new(instance_lock: File, ctx: &egui::Context) -> Self {
         let state_file = state_path();
         let mut state = load_state(&state_file);
+        let mut dynamic_recovery: Vec<Group> = std::mem::take(&mut state.dynamic_groups)
+            .into_values()
+            .filter(|group| !group.is_visible)
+            .collect();
+        if !dynamic_recovery.is_empty()
+            && let Ok(windows) = NativeWindowController::enumerate_fast()
+        {
+            let recovery_actions: Vec<_> = dynamic_recovery
+                .iter()
+                .flat_map(|group| restore_group_actions(group, &windows))
+                .collect();
+            if let Err(error) = NativeWindowController::apply_actions(recovery_actions) {
+                eprintln!("Could not restore windows from the previous VeilKey session: {error}");
+            }
+            dynamic_recovery.clear();
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let (tray_icon, tray_events, exit_requested) = match create_tray(ctx) {
+            Ok(tray) => (Some(tray.0), tray.1, tray.2),
+            Err(error) => {
+                eprintln!("Could not create VeilKey notification-area icon: {error}");
+                let (_sender, receiver) = mpsc::channel();
+                (None, receiver, Arc::new(AtomicBool::new(false)))
+            }
+        };
         for group in &mut state.groups {
             group.hotkey_draft = group.hotkey.clone().unwrap_or_default();
         }
+        let dynamic_range_draft = state.clone();
+        let dynamic_suffix_input = suffix_input(&state.dynamic_suffixes);
         // A slow Accessibility query must never let stale snapshots accumulate.
         let (window_tx, window_rx) = mpsc::sync_channel(1);
         let (refresh_tx, refresh_rx) = mpsc::sync_channel(1);
-        let snapshot_generation = Arc::new(AtomicU64::new(0));
-        let refresh_generation = Arc::clone(&snapshot_generation);
-        let native_window_lock = Arc::new(NativeWindowLock::new());
-        let refresh_window_lock = Arc::clone(&native_window_lock);
         thread::spawn(move || {
-            while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
-                refresh_rx.recv_timeout(Duration::from_secs(2))
-            {
-                while refresh_rx.try_recv().is_ok() {}
-                let generation = refresh_generation.load(Ordering::Acquire);
-                let snapshot = with_native_window_lock(&refresh_window_lock, || {
-                    enumerate_windows_resiliently(NativeWindowController::enumerate)
-                });
-                if window_tx.send((generation, snapshot)).is_err() {
+            loop {
+                let include_previews = match refresh_rx.recv_timeout(Duration::from_secs(10)) {
+                    Ok(include_previews) => include_previews,
+                    Err(mpsc::RecvTimeoutError::Timeout) => false,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                };
+                let mut include_previews = include_previews;
+                while let Ok(requested) = refresh_rx.try_recv() {
+                    include_previews |= requested;
+                }
+                let windows = if include_previews {
+                    NativeWindowController::enumerate()
+                } else {
+                    NativeWindowController::enumerate_fast()
+                };
+                if window_tx.send(windows).is_err() {
                     break;
                 }
             }
         });
         let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
         let (action_results, action_rx) = mpsc::channel();
-        let action_generation = Arc::clone(&snapshot_generation);
-        let action_window_lock = Arc::clone(&native_window_lock);
+        let action_refresh_tx = refresh_tx.clone();
         thread::spawn(move || {
             while let Ok(actions) = action_requests.recv() {
-                // Odd generations mean a native operation is in progress. Any
-                // concurrent enumeration is discarded, even if it returns late.
-                let completion = run_protected_window_operation(&action_generation, || {
-                    with_native_window_lock(&action_window_lock, || {
-                        let retry = actions.clone();
-                        let applied = match NativeWindowController::apply_actions(actions) {
-                            Ok(()) => Ok(()),
-                            Err(first) => match NativeWindowController::apply_actions(retry) {
-                                Ok(()) => Ok(()),
-                                Err(second) => Err(format!("{first}; retry failed: {second}")),
-                            },
-                        };
-                        let snapshot =
-                            enumerate_windows_resiliently(NativeWindowController::enumerate);
-                        (applied, snapshot)
-                    })
-                });
-                if action_results.send(completion).is_err() {
+                let retry = actions.clone();
+                let applied = match NativeWindowController::apply_actions(actions) {
+                    Ok(()) => Ok(()),
+                    Err(first) => match NativeWindowController::apply_actions(retry) {
+                        Ok(()) => Ok(()),
+                        Err(second) => Err(format!("{first}; retry failed: {second}")),
+                    },
+                };
+                if action_results.send((applied, Ok(Vec::new()))).is_err() {
                     break;
                 }
+                let _ = action_refresh_tx.try_send(false);
             }
         });
         let capture_armed = Arc::new(AtomicBool::new(false));
         let listener_capture_armed = Arc::clone(&capture_armed);
         let capture_listener_alive = Arc::new(AtomicBool::new(false));
         let listener_alive = Arc::clone(&capture_listener_alive);
-        let (capture_tx, capture_rx) = mpsc::channel();
+        let (capture_tx, capture_rx) = mpsc::sync_channel(32);
         let (focused_binding_tx, focused_binding_rx) = mpsc::channel();
+        let (dynamic_toggle_tx, dynamic_toggle_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut failures = 0_u32;
             loop {
-                let mut down = HashSet::<rdev::Key>::new();
-                let listener_armed = Arc::clone(&listener_capture_armed);
-                let callback_tx = capture_tx.clone();
-                listener_alive.store(true, Ordering::Release);
-                let callback = move |event: rdev::Event| match event.event_type {
-                    rdev::EventType::KeyPress(key) => {
-                        down.insert(key);
-                        if listener_armed.load(Ordering::Relaxed) && !is_modifier(key) {
-                            let ctrl = down.contains(&rdev::Key::ControlLeft)
-                                || down.contains(&rdev::Key::ControlRight);
-                            let alt =
-                                down.contains(&rdev::Key::Alt) || down.contains(&rdev::Key::AltGr);
-                            let shift = down.contains(&rdev::Key::ShiftLeft)
-                                || down.contains(&rdev::Key::ShiftRight);
-                            let super_key = down.contains(&rdev::Key::MetaLeft)
-                                || down.contains(&rdev::Key::MetaRight);
-                            if (ctrl || alt || shift || super_key)
-                                && let Some(key_name) = hotkey_key_name(key)
-                            {
-                                let mut parts = Vec::new();
-                                if ctrl {
-                                    parts.push("ctrl");
-                                }
-                                if alt {
-                                    parts.push("alt");
-                                }
-                                if shift {
-                                    parts.push("shift");
-                                }
-                                if super_key {
-                                    parts.push("super");
-                                }
-                                parts.push(key_name);
-                                if listener_armed.swap(false, Ordering::AcqRel) {
-                                    let _ = callback_tx.send(Ok(parts.join("+")));
+                let attempt_started = Instant::now();
+                #[cfg(target_os = "windows")]
+                let error = windows_keyboard::listen(
+                    Arc::clone(&listener_capture_armed),
+                    Arc::clone(&listener_alive),
+                    capture_tx.clone(),
+                )
+                .err()
+                .unwrap_or_else(|| "listener stopped unexpectedly".into());
+                #[cfg(not(target_os = "windows"))]
+                let error = {
+                    let mut down = HashSet::<rdev::Key>::new();
+                    let listener_armed = Arc::clone(&listener_capture_armed);
+                    let callback_tx = capture_tx.clone();
+                    listener_alive.store(true, Ordering::Release);
+                    let callback = move |event: rdev::Event| match event.event_type {
+                        rdev::EventType::KeyPress(key) => {
+                            down.insert(key);
+                            if listener_armed.load(Ordering::Relaxed) && !is_modifier(key) {
+                                let ctrl = down.contains(&rdev::Key::ControlLeft)
+                                    || down.contains(&rdev::Key::ControlRight);
+                                let alt = down.contains(&rdev::Key::Alt)
+                                    || down.contains(&rdev::Key::AltGr);
+                                let shift = down.contains(&rdev::Key::ShiftLeft)
+                                    || down.contains(&rdev::Key::ShiftRight);
+                                let super_key = down.contains(&rdev::Key::MetaLeft)
+                                    || down.contains(&rdev::Key::MetaRight);
+                                if (ctrl || alt || shift || super_key)
+                                    && let Some(key_name) = hotkey_key_name(key)
+                                {
+                                    let mut parts = Vec::new();
+                                    if ctrl {
+                                        parts.push("ctrl");
+                                    }
+                                    if alt {
+                                        parts.push("alt");
+                                    }
+                                    if shift {
+                                        parts.push("shift");
+                                    }
+                                    if super_key {
+                                        parts.push("super");
+                                    }
+                                    parts.push(key_name);
+                                    if listener_armed.swap(false, Ordering::AcqRel) {
+                                        let _ = callback_tx.send(Ok(parts.join("+")));
+                                    }
                                 }
                             }
                         }
-                    }
-                    rdev::EventType::KeyRelease(key) => {
-                        down.remove(&key);
-                    }
-                    _ => {}
+                        rdev::EventType::KeyRelease(key) => {
+                            down.remove(&key);
+                        }
+                        _ => {}
+                    };
+                    rdev::listen(callback)
+                        .err()
+                        .map(|error| format!("{error:?}"))
+                        .unwrap_or_else(|| "listener stopped unexpectedly".into())
                 };
-                let attempt_started = Instant::now();
-                let error = rdev::listen(callback)
-                    .err()
-                    .map(|error| format!("{error:?}"))
-                    .unwrap_or_else(|| "listener stopped unexpectedly".into());
                 listener_alive.store(false, Ordering::Release);
                 let _ = capture_tx.send(Err(format!("Global key capture unavailable: {error}")));
                 let delay =
@@ -529,10 +764,7 @@ impl VeilKeyApp {
         let mut app = Self {
             state,
             windows: Vec::new(),
-            snapshot_updated_at: None,
             window_rx,
-            snapshot_generation,
-            native_window_lock,
             refresh_tx,
             hotkeys,
             state_file,
@@ -540,10 +772,8 @@ impl VeilKeyApp {
             filter: String::new(),
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
-            hotkey_retry_attempts: 0,
             registered_hotkey_ids: HashSet::new(),
             recording_group: None,
-            settings_open: false,
             capture_armed,
             capture_listener_alive,
             capture_listener_was_alive: false,
@@ -552,14 +782,36 @@ impl VeilKeyApp {
             focused_binding_tx,
             focused_binding_in_flight: false,
             pending_bind_group: None,
+            dynamic_toggle_rx,
+            dynamic_toggle_tx,
+            dynamic_toggle_in_flight: false,
+            dynamic_hotkey_roles: HashMap::new(),
+            dynamic_range_draft,
+            dynamic_suffix_input,
+            dynamic_config_error: String::new(),
+            dynamic_recovery,
             action_tx,
             action_rx,
             action_in_flight: false,
             queued_toggles: VecDeque::new(),
-            waiting_toggles: VecDeque::new(),
+            preview_textures: HashMap::new(),
+            preview_pixels: HashMap::new(),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            tray_icon,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            tray_events,
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            exit_requested,
         };
+        let permission_status = app.state.status.clone();
         app.register_saved_hotkeys();
-        request_window_refresh(&app.refresh_tx);
+        if !app.register_dynamic_hotkeys() {
+            app.hotkey_retry_needed = true;
+        }
+        if !permission_status.is_empty() {
+            app.state.status = localized_status(app.state.english_ui, &permission_status);
+        }
+        request_window_refresh(&app.refresh_tx, false);
         app
     }
 
@@ -577,25 +829,26 @@ impl VeilKeyApp {
             return;
         };
         let mut failed = Vec::new();
-        let mut retry_needed = false;
         for group in &self.state.groups {
             if let Some(value) = group.hotkey.as_deref() {
                 match HotKey::from_str(value) {
-                    Ok(hotkey) => match manager.register(hotkey) {
-                        Ok(()) => {
-                            self.registered_hotkey_ids.insert(hotkey.id);
-                        }
-                        Err(error) => {
-                            retry_needed |= hotkey_registration_is_retryable(&error);
-                            failed.push(format!("{} ({value})", group.name));
-                        }
-                    },
+                    Ok(hotkey) if manager.register(hotkey).is_ok() => {
+                        self.registered_hotkey_ids.insert(hotkey.id);
+                    }
+                    Ok(_) => failed.push(format!("{} ({value})", group.name)),
                     Err(_) => failed.push(format!("{} (invalid shortcut)", group.name)),
                 }
             }
         }
+        for role in self.dynamic_hotkey_roles.values() {
+            if manager.register(role.hotkey).is_ok() {
+                self.registered_hotkey_ids.insert(role.hotkey.id);
+            } else {
+                failed.push(format!("Dynamic shortcut ({})", role.hotkey));
+            }
+        }
         if !failed.is_empty() {
-            self.hotkey_retry_needed = retry_needed;
+            self.hotkey_retry_needed = true;
             self.state.status = format!(
                 "Some shortcuts could not be registered: {}",
                 failed.join(", ")
@@ -612,6 +865,10 @@ impl VeilKeyApp {
             self.state.status = "Use a shortcut such as ctrl+alt+KeyH or super+shift+KeyH.".into();
             return;
         };
+        if self.dynamic_hotkey_roles.contains_key(&hotkey.id) {
+            self.state.status = "这个快捷键已用于动态窗口范围。".into();
+            return;
+        }
         if self.state.groups.iter().enumerate().any(|(i, group)| {
             i != index
                 && group
@@ -654,24 +911,83 @@ impl VeilKeyApp {
                 self.persist();
             }
             Err(error) => {
-                self.hotkey_retry_needed = false;
+                self.hotkey_retry_needed = true;
                 if let Some(old) = old_value
                     .as_deref()
                     .and_then(|old| HotKey::from_str(old).ok())
+                    && manager.register(old).is_ok()
                 {
-                    match manager.register(old) {
-                        Ok(()) => {
-                            self.registered_hotkey_ids.insert(old.id);
-                        }
-                        Err(restore_error) => {
-                            self.hotkey_retry_needed =
-                                hotkey_registration_is_retryable(&restore_error);
-                        }
-                    }
+                    self.registered_hotkey_ids.insert(old.id);
                 }
                 self.state.status = format!("Could not register shortcut: {error}");
             }
         }
+    }
+
+    fn register_dynamic_hotkeys(&mut self) -> bool {
+        let planned = match plan_dynamic_hotkeys(&self.state) {
+            Ok(roles) => roles,
+            Err(error) => {
+                self.state.status = error;
+                return false;
+            }
+        };
+        let Some(manager) = &self.hotkeys else {
+            self.state.status = "Global shortcuts are unavailable on this system.".into();
+            return false;
+        };
+        let previous: Vec<_> = self.dynamic_hotkey_roles.values().cloned().collect();
+        let mut registered: Vec<DynamicHotkeyRole> = Vec::new();
+        for role in &planned {
+            let hotkey = role.hotkey;
+            if self.dynamic_hotkey_roles.contains_key(&hotkey.id)
+                && self.registered_hotkey_ids.contains(&hotkey.id)
+            {
+                continue;
+            }
+            if let Err(error) = manager.register(hotkey) {
+                for role in &registered {
+                    if manager.unregister(role.hotkey).is_ok() {
+                        self.registered_hotkey_ids.remove(&role.hotkey.id);
+                    }
+                }
+                self.state.status = format!("Could not register shortcut range: {error}");
+                self.hotkey_retry_needed = true;
+                return false;
+            }
+            self.registered_hotkey_ids.insert(hotkey.id);
+            registered.push(role.clone());
+        }
+        let mut removed: Vec<DynamicHotkeyRole> = Vec::new();
+        for role in &previous {
+            if planned.iter().any(|next| next.hotkey.id == role.hotkey.id) {
+                continue;
+            }
+            if let Err(error) = manager.unregister(role.hotkey) {
+                for added in &registered {
+                    if manager.unregister(added.hotkey).is_ok() {
+                        self.registered_hotkey_ids.remove(&added.hotkey.id);
+                    }
+                }
+                for old in removed {
+                    if manager.register(old.hotkey).is_ok() {
+                        self.registered_hotkey_ids.insert(old.hotkey.id);
+                    }
+                }
+                self.hotkey_retry_needed = true;
+                self.state.status = format!("Could not replace shortcut range: {error}");
+                return false;
+            }
+            self.registered_hotkey_ids.remove(&role.hotkey.id);
+            removed.push(role.clone());
+        }
+        self.dynamic_hotkey_roles = planned
+            .into_iter()
+            .map(|role| (role.hotkey.id, role))
+            .collect();
+        self.state.status = "Dynamic shortcut ranges registered.".into();
+        self.persist();
+        true
     }
 
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
@@ -690,29 +1006,29 @@ impl VeilKeyApp {
     }
 
     fn update_window_actions(&mut self) {
-        while let Ok((generation, applied, snapshot)) = self.action_rx.try_recv() {
+        while let Ok((applied, snapshot)) = self.action_rx.try_recv() {
             self.action_in_flight = false;
             match applied {
                 Ok(()) => {}
                 Err(error) => self.state.status = error,
             }
-            if snapshot_is_current(generation, self.snapshot_generation.load(Ordering::Acquire)) {
-                match snapshot {
-                    Ok(windows) => {
+            match snapshot {
+                Ok(windows) => {
+                    if !windows.is_empty() {
+                        retain_unrestored_targets(&mut self.dynamic_recovery, &windows);
                         self.windows = windows;
-                        self.snapshot_updated_at = Some(Instant::now());
                     }
-                    Err(error) => {
-                        self.queued_toggles.clear();
-                        self.waiting_toggles.clear();
-                        if self.state.status.is_empty() {
-                            self.state.status = error;
-                        }
+                }
+                Err(error) => {
+                    self.queued_toggles.clear();
+                    if self.state.status.is_empty() {
+                        self.state.status = error;
                     }
                 }
             }
         }
         if !self.action_in_flight
+            && !self.dynamic_toggle_in_flight
             && let Some(group_name) = self.queued_toggles.pop_front()
             && let Some(index) = self
                 .state
@@ -722,19 +1038,15 @@ impl VeilKeyApp {
         {
             self.toggle_group_now(index);
         }
-        self.start_waiting_toggle_if_ready();
     }
 
     fn retry_hotkeys_if_needed(&mut self) {
-        if !self.hotkey_retry_needed
-            || self.last_hotkey_retry.elapsed() < hotkey_retry_delay(self.hotkey_retry_attempts)
-        {
+        if !self.hotkey_retry_needed || self.last_hotkey_retry.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.last_hotkey_retry = Instant::now();
         if self.hotkeys.is_none() {
             let Ok(manager) = GlobalHotKeyManager::new() else {
-                self.hotkey_retry_attempts = self.hotkey_retry_attempts.saturating_add(1);
                 return;
             };
             self.hotkeys = Some(manager);
@@ -744,16 +1056,11 @@ impl VeilKeyApp {
             return;
         };
         let mut failed = Vec::new();
-        let mut retry_needed = false;
         for (name, hotkey) in pending_hotkeys(&self.state.groups, &self.registered_hotkey_ids) {
-            match manager.register(hotkey) {
-                Ok(()) => {
-                    self.registered_hotkey_ids.insert(hotkey.id);
-                }
-                Err(error) => {
-                    retry_needed |= hotkey_registration_is_retryable(&error);
-                    failed.push(format!("{name} ({error})"));
-                }
+            if manager.register(hotkey).is_ok() {
+                self.registered_hotkey_ids.insert(hotkey.id);
+            } else {
+                failed.push(name);
             }
         }
         failed.extend(
@@ -768,12 +1075,24 @@ impl VeilKeyApp {
                 })
                 .map(|group| group.name.clone()),
         );
-        self.hotkey_retry_needed = retry_needed;
+        for role in self.dynamic_hotkey_roles.values() {
+            if !self.registered_hotkey_ids.contains(&role.hotkey.id) {
+                if manager.register(role.hotkey).is_ok() {
+                    self.registered_hotkey_ids.insert(role.hotkey.id);
+                } else {
+                    failed.push(format!("Dynamic shortcut {}", role.hotkey));
+                }
+            }
+        }
+        self.hotkey_retry_needed = !failed.is_empty();
         if failed.is_empty() {
-            self.hotkey_retry_attempts = 0;
             self.state.status = "Shortcuts recovered.".into();
-        } else if retry_needed {
-            self.hotkey_retry_attempts = self.hotkey_retry_attempts.saturating_add(1);
+        }
+        if self.state.bind_mode.is_dynamic()
+            && self.dynamic_hotkey_roles.is_empty()
+            && !self.register_dynamic_hotkeys()
+        {
+            self.hotkey_retry_needed = true;
         }
     }
 
@@ -814,19 +1133,13 @@ impl VeilKeyApp {
                     .into();
                     self.focused_binding_in_flight = true;
                     let sender = self.focused_binding_tx.clone();
-                    let focused_window_lock = Arc::clone(&self.native_window_lock);
                     thread::spawn(move || {
-                        let (focused, windows) = lookup_focused_window_resiliently(|| {
-                            with_native_window_lock(&focused_window_lock, || {
-                                let focused = NativeWindowController::foreground_window_id();
-                                let windows = if matches!(focused, Ok(Some(_))) {
-                                    enumerate_windows_resiliently(NativeWindowController::enumerate)
-                                } else {
-                                    Ok(Vec::new())
-                                };
-                                (focused, windows)
-                            })
-                        });
+                        let focused = NativeWindowController::foreground_window_id();
+                        let windows = if matches!(focused, Ok(Some(_))) {
+                            NativeWindowController::enumerate_fast()
+                        } else {
+                            Ok(Vec::new())
+                        };
                         let _ = sender.send((chord, focused, windows));
                     });
                 }
@@ -909,33 +1222,125 @@ impl VeilKeyApp {
         }
     }
 
-    fn arm_focused_window_binding(&mut self, english: bool) {
-        if self.focused_binding_in_flight {
-            self.state.status = tr(
-                english,
-                "The previous focused-window lookup is still running.",
-                "上一次前台窗口识别仍在进行，请稍候。",
-            )
-            .into();
+    fn process_dynamic_toggle_results(&mut self, english: bool) {
+        while let Ok((mode, suffix, focused, windows)) = self.dynamic_toggle_rx.try_recv() {
+            self.dynamic_toggle_in_flight = false;
+            let windows = match windows {
+                Ok(windows) => windows,
+                Err(error) => {
+                    self.state.status = error;
+                    continue;
+                }
+            };
+            self.windows = windows;
+            let mut actions = Vec::new();
+            let binding = should_bind_slot(
+                self.state.dynamic_groups.get(&suffix),
+                focused.as_ref().ok().and_then(|value| value.as_deref()),
+                &self.windows,
+            );
+            if binding {
+                let focused = match focused {
+                    Ok(Some(id)) => id,
+                    Ok(None) => {
+                        self.state.status =
+                            tr(english, "No foreground window.", "没有可用的前台窗口。").into();
+                        continue;
+                    }
+                    Err(error) => {
+                        self.state.status = error;
+                        continue;
+                    }
+                };
+                let Some(ids) = dynamic_target_ids(mode, &focused, &self.windows) else {
+                    self.state.status = "无法识别当前窗口目标。".into();
+                    continue;
+                };
+                if ids.iter().any(|id| {
+                    self.windows
+                        .iter()
+                        .any(|w| &w.id == id && w.process_id == std::process::id())
+                }) {
+                    self.state.status = "请切换到目标应用后再绑定。".into();
+                    continue;
+                }
+                // Restore the previous target before replacing this slot.
+                if let Some(old) = self.state.dynamic_groups.get(&suffix) {
+                    let old = old.clone();
+                    if !old.is_visible {
+                        actions.extend(restore_group_actions(&old, &self.windows));
+                        self.dynamic_recovery.push(old);
+                    }
+                }
+                // Transfer overlapping targets out of other slots so their shortcuts
+                // cannot hide/show the same window with conflicting saved geometry.
+                for group in self.state.dynamic_groups.values_mut() {
+                    group
+                        .window_ids
+                        .retain(|id| !ids.iter().any(|next| veilkey::same_window_id(next, id)));
+                }
+                let title = self
+                    .windows
+                    .iter()
+                    .find(|w| w.id == focused)
+                    .map(|w| w.title.clone())
+                    .unwrap_or_default();
+                let mut group = Group {
+                    name: title,
+                    window_ids: ids.into_iter().collect(),
+                    hotkey: Some(suffix.clone()),
+                    hotkey_draft: String::new(),
+                    is_visible: true,
+                    force_popup: false,
+                    macos_hide_application: cfg!(target_os = "macos")
+                        && mode == BindMode::ActiveApplication,
+                    restore_rects: Default::default(),
+                };
+                actions.extend(slot_actions(&mut group, &self.windows));
+                self.state.dynamic_groups.insert(suffix, group);
+            } else if let Some(group) = self.state.dynamic_groups.get_mut(&suffix) {
+                actions.extend(slot_actions(group, &self.windows));
+            } else {
+                self.state.status = "此按键尚未绑定窗口。".into();
+                continue;
+            }
+            if actions.is_empty() {
+                self.state.status = tr(
+                    english,
+                    "No windows could be toggled.",
+                    "没有可切换的窗口。",
+                )
+                .into();
+            } else {
+                self.state.status.clear();
+                self.apply_actions(actions);
+                self.persist();
+            }
+        }
+    }
+
+    fn activate_dynamic_hotkey(&mut self, role: DynamicHotkeyRole) {
+        if self.dynamic_toggle_in_flight || self.action_in_flight {
+            self.state.status = "A window operation is already in progress.".into();
             return;
         }
-        self.pending_bind_group = None;
-        self.capture_armed.store(true, Ordering::Release);
-        self.state.status = if self.capture_listener_alive.load(Ordering::Acquire) {
-            tr(
-                english,
-                "Focus the target window and press Ctrl/Alt/Shift/Win + a key.",
-                "切到目标窗口，按 Ctrl/Alt/Shift/Win + 任意键完成绑定。",
-            )
-            .into()
-        } else {
-            tr(
-                english,
-                "Keyboard listener is restarting; your binding will stay armed.",
-                "键盘监听正在恢复，绑定请求会保留，请稍后按下快捷键。",
-            )
-            .into()
-        };
+        self.dynamic_toggle_in_flight = true;
+        let mode = self.state.bind_mode;
+        let previous_window_ids: Vec<String> = self
+            .state
+            .dynamic_groups
+            .get(&role.suffix)
+            .map(|group| group.window_ids.iter().cloned().collect())
+            .unwrap_or_default();
+        let sender = self.dynamic_toggle_tx.clone();
+        thread::spawn(move || {
+            let (focused, windows) =
+                match NativeWindowController::focused_window_snapshot(&previous_window_ids) {
+                    Ok((focused, windows)) => (Ok(focused), Ok(windows)),
+                    Err(error) => (Err(error.clone()), Err(error)),
+                };
+            let _ = sender.send((mode, role.suffix, focused, windows));
+        });
     }
 
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
@@ -970,7 +1375,7 @@ impl VeilKeyApp {
             debug_name
         };
         let mut parts = Vec::new();
-        if modifiers.ctrl || modifiers.mac_cmd {
+        if modifiers.ctrl {
             parts.push("ctrl");
         }
         if modifiers.alt {
@@ -979,7 +1384,8 @@ impl VeilKeyApp {
         if modifiers.shift {
             parts.push("shift");
         }
-        if modifiers.command && !modifiers.mac_cmd {
+        if modifiers.mac_cmd || (modifiers.command && !cfg!(target_os = "macos") && !modifiers.ctrl)
+        {
             parts.push("super");
         }
         parts.push(key_name.as_str());
@@ -1001,48 +1407,19 @@ impl VeilKeyApp {
     }
 
     fn toggle_group(&mut self, index: usize) {
-        let Some(group_name) = self.state.groups.get(index).map(|group| group.name.clone()) else {
-            return;
-        };
-        if self.action_in_flight {
+        if self.action_in_flight || self.dynamic_toggle_in_flight {
             // Preserve the order of groups that may overlap; only adjacent repeated
             // toggles cancel while a native operation is pending.
+            let Some(group_name) = self.state.groups.get(index).map(|group| group.name.clone())
+            else {
+                return;
+            };
             if !enqueue_toggle(&mut self.queued_toggles, group_name, 16) {
                 self.state.status = "Too many window shortcuts are queued.".into();
             }
             return;
         }
-        if !self.waiting_toggles.is_empty()
-            || !snapshot_is_fresh(self.snapshot_updated_at, Instant::now())
-        {
-            if !enqueue_toggle(&mut self.waiting_toggles, group_name, 16) {
-                self.state.status = "Too many window shortcuts are queued.".into();
-                return;
-            }
-            self.state.status = "Refreshing window state before toggling.".into();
-            request_window_refresh(&self.refresh_tx);
-            return;
-        }
         self.toggle_group_now(index);
-    }
-
-    fn start_waiting_toggle_if_ready(&mut self) {
-        if self.action_in_flight || !snapshot_is_fresh(self.snapshot_updated_at, Instant::now()) {
-            return;
-        }
-        while let Some(group_name) = self.waiting_toggles.pop_front() {
-            if let Some(index) = self
-                .state
-                .groups
-                .iter()
-                .position(|group| group.name == group_name)
-            {
-                self.toggle_group_now(index);
-                if self.action_in_flight {
-                    break;
-                }
-            }
-        }
     }
 
     fn toggle_group_now(&mut self, index: usize) {
@@ -1059,10 +1436,15 @@ impl VeilKeyApp {
 
     fn handle_hotkey_events(&mut self) {
         let mut group_to_toggle = None;
+        let mut dynamic_toggle = None;
         if let Some(receiver) = Some(GlobalHotKeyEvent::receiver()) {
             while let Ok(event) = receiver.try_recv() {
                 if event.state() != HotKeyState::Pressed {
                     continue;
+                }
+                if let Some(role) = self.dynamic_hotkey_roles.get(&event.id()).cloned() {
+                    dynamic_toggle = Some(role);
+                    break;
                 }
                 group_to_toggle = self.state.groups.iter().position(|group| {
                     group
@@ -1076,29 +1458,24 @@ impl VeilKeyApp {
                 }
             }
         }
-        if let Some(index) = group_to_toggle {
+        if let Some(role) = dynamic_toggle {
+            self.activate_dynamic_hotkey(role);
+        } else if let Some(index) = group_to_toggle {
             self.toggle_group(index);
         }
     }
 
     fn update_window_snapshot(&mut self) {
         let mut latest = None;
-        while let Ok((generation, result)) = self.window_rx.try_recv() {
-            latest = Some((generation, result));
+        while let Ok(result) = self.window_rx.try_recv() {
+            latest = Some(result);
         }
-        if let Some((generation, result)) = latest
-            && snapshot_is_current(generation, self.snapshot_generation.load(Ordering::Acquire))
-        {
+        if let Some(result) = latest {
             match result {
                 Ok(windows) => {
                     self.windows = windows;
-                    self.snapshot_updated_at = Some(Instant::now());
-                    self.start_waiting_toggle_if_ready();
                 }
-                Err(error) => {
-                    self.waiting_toggles.clear();
-                    self.state.status = error;
-                }
+                Err(error) => self.state.status = error,
             }
         }
     }
@@ -1116,10 +1493,341 @@ impl VeilKeyApp {
         }
         self.capture_listener_was_alive = alive;
     }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn process_tray_commands(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.tray_events.try_recv() {
+            match command {
+                TrayCommand::Show => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                }
+                TrayCommand::Exit => {
+                    self.exit_requested.store(true, Ordering::Release);
+                }
+            }
+        }
+        if self.on_exit_requested() && !self.action_in_flight && !self.dynamic_toggle_in_flight {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    fn on_exit_requested(&self) -> bool {
+        self.exit_requested.load(Ordering::Acquire)
+    }
+
+    fn dynamic_ui(&mut self, ui: &mut egui::Ui, english: bool) {
+        let mut apply = false;
+        let mut reset = false;
+        let mut cancel = false;
+        let parsed = parse_suffix_input(&self.dynamic_suffix_input);
+        let dirty = self.dynamic_range_draft.dynamic_toggle_modifiers
+            != self.state.dynamic_toggle_modifiers
+            || parsed.as_ref().ok() != Some(&self.state.dynamic_suffixes);
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            ui.heading(tr(english, "Shortcuts", "快捷键设置"));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                apply = ui
+                    .add_enabled(
+                        dirty && !self.action_in_flight && !self.dynamic_toggle_in_flight,
+                        egui::Button::new(tr(english, "Apply configuration", "应用配置")),
+                    )
+                    .clicked();
+                if dirty {
+                    cancel = ui.button(tr(english, "Cancel", "取消修改")).clicked();
+                    ui.weak(tr(english, "Unsaved changes", "修改未生效"));
+                }
+            });
+        });
+        ui.add_space(16.0);
+        egui::Grid::new("dynamic_modifiers")
+            .spacing([28.0, 16.0])
+            .show(ui, |ui| {
+                {
+                    let label = tr(english, "Shortcut modifiers", "快捷键修饰键");
+                    let modifiers = &mut self.dynamic_range_draft.dynamic_toggle_modifiers;
+                    ui.label(label);
+                    ui.horizontal(|ui| {
+                        for (key, label) in [
+                            (
+                                "super",
+                                if cfg!(target_os = "macos") {
+                                    "Command"
+                                } else {
+                                    "Win"
+                                },
+                            ),
+                            (
+                                "ctrl",
+                                if cfg!(target_os = "macos") {
+                                    "Control"
+                                } else {
+                                    "Ctrl"
+                                },
+                            ),
+                            (
+                                "alt",
+                                if cfg!(target_os = "macos") {
+                                    "Option"
+                                } else {
+                                    "Alt"
+                                },
+                            ),
+                            ("shift", "Shift"),
+                        ] {
+                            let mut selected = modifiers.iter().any(|value| value == key);
+                            if ui.checkbox(&mut selected, label).changed() {
+                                modifiers.retain(|value| value != key);
+                                if selected {
+                                    modifiers.push(key.into());
+                                }
+                            }
+                        }
+                    });
+                    ui.end_row();
+                }
+                ui.label(tr(english, "Key range", "按键范围"));
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.dynamic_suffix_input)
+                        .desired_width(330.0)
+                        .hint_text("9 0 - ="),
+                );
+                ui.end_row();
+            });
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            reset = ui
+                .button(tr(english, "Restore defaults", "恢复默认"))
+                .clicked();
+            ui.add_space(12.0);
+            egui::ComboBox::from_id_salt("suffix_presets")
+                .selected_text(tr(english, "Common key ranges", "常用按键"))
+                .show_ui(ui, |ui| {
+                    for (label, value) in [
+                        ("a – z", "abcdefghijklmnopqrstuvwxyz"),
+                        ("9 0 - =", "9 0 - ="),
+                        ("0 – 9", "0 1 2 3 4 5 6 7 8 9"),
+                        ("F1 – F4", "F1 F2 F3 F4"),
+                    ] {
+                        if ui.selectable_label(false, label).clicked() {
+                            self.dynamic_suffix_input = value.into();
+                        }
+                    }
+                });
+        });
+        if reset {
+            self.dynamic_range_draft = AppState::default();
+            self.dynamic_suffix_input = suffix_input(&self.dynamic_range_draft.dynamic_suffixes);
+            self.dynamic_config_error.clear();
+        }
+        if cancel {
+            self.dynamic_range_draft = self.state.clone();
+            self.dynamic_suffix_input = suffix_input(&self.state.dynamic_suffixes);
+            self.dynamic_config_error.clear();
+        }
+        ui.add_space(16.0);
+        if dirty && !reset && !cancel {
+            match parse_suffix_input(&self.dynamic_suffix_input) {
+                Ok(suffixes) => {
+                    let mut proposed = self.state.clone();
+                    proposed.dynamic_suffixes = suffixes;
+                    proposed.dynamic_toggle_modifiers =
+                        self.dynamic_range_draft.dynamic_toggle_modifiers.clone();
+                    self.dynamic_config_error =
+                        plan_dynamic_hotkeys(&proposed).err().unwrap_or_default();
+                }
+                Err(error) => self.dynamic_config_error = error,
+            }
+        }
+        if !self.dynamic_config_error.is_empty() {
+            ui.colored_label(
+                egui::Color32::from_rgb(180, 64, 52),
+                &self.dynamic_config_error,
+            );
+        }
+        if apply && (self.action_in_flight || self.dynamic_toggle_in_flight) {
+            self.state.status = "请等待当前窗口操作完成。".into();
+        } else if apply && self.dynamic_config_error.is_empty() {
+            let previous = (
+                self.state.dynamic_toggle_modifiers.clone(),
+                self.state.dynamic_suffixes.clone(),
+            );
+            self.state.dynamic_toggle_modifiers =
+                self.dynamic_range_draft.dynamic_toggle_modifiers.clone();
+            self.state.dynamic_suffixes =
+                parse_suffix_input(&self.dynamic_suffix_input).unwrap_or_default();
+            if !self.register_dynamic_hotkeys() {
+                self.dynamic_config_error = localized_status(english, &self.state.status);
+                (
+                    self.state.dynamic_toggle_modifiers,
+                    self.state.dynamic_suffixes,
+                ) = previous;
+            } else {
+                self.dynamic_range_draft = self.state.clone();
+                self.dynamic_suffix_input = suffix_input(&self.state.dynamic_suffixes);
+                self.dynamic_config_error.clear();
+                self.state.status.clear();
+            }
+        }
+        ui.add_space(8.0);
+        ui.separator();
+        ui.add_space(12.0);
+        ui.heading(tr(english, "Current bindings", "当前绑定"));
+        ui.add_space(12.0);
+        let suffixes: Vec<_> = self
+            .state
+            .dynamic_groups
+            .iter()
+            .filter(|(_, group)| is_bound_in_session(group))
+            .map(|(key, _)| key.clone())
+            .collect();
+        let mut toggle = None;
+        if suffixes.is_empty() {
+            ui.weak(tr(
+                english,
+                "No windows bound this session",
+                "本次运行尚未绑定窗口",
+            ));
+        }
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            egui::Grid::new("dynamic_slots")
+                .num_columns(3)
+                .striped(true)
+                .min_row_height(44.0)
+                .spacing([24.0, 10.0])
+                .show(ui, |ui| {
+                    ui.strong(tr(english, "Shortcut", "快捷键"));
+                    ui.strong(tr(english, "Window / group", "窗口 / 窗口组"));
+                    ui.label("");
+                    ui.end_row();
+                    for suffix in suffixes {
+                        {
+                            let role = self
+                                .dynamic_hotkey_roles
+                                .values()
+                                .find(|role| role.suffix == suffix);
+                            ui.label(
+                                egui::RichText::new(if role.is_some() {
+                                    readable_chord(&suffix, cfg!(target_os = "macos"))
+                                } else {
+                                    tr(english, "Disabled", "已停用").into()
+                                })
+                                .strong(),
+                            );
+                        }
+                        if let Some(group) = self.state.dynamic_groups.get(&suffix) {
+                            ui.vertical(|ui| {
+                                ui.set_max_width(280.0);
+                                ui.strong(&group.name);
+                                for id in &group.window_ids {
+                                    let window = self.windows.iter().find(|w| &w.id == id);
+                                    ui.label(
+                                        window
+                                            .map(|w| format!("{} · {}", w.app, w.title))
+                                            .unwrap_or_else(|| {
+                                                tr(english, "Window closed", "窗口已关闭").into()
+                                            }),
+                                    );
+                                }
+                            });
+                            if ui
+                                .add_enabled(
+                                    !self.action_in_flight && !self.dynamic_toggle_in_flight,
+                                    egui::Button::new(if group.is_visible {
+                                        tr(english, "Hide", "隐藏")
+                                    } else {
+                                        tr(english, "Show", "显示")
+                                    }),
+                                )
+                                .clicked()
+                            {
+                                toggle = Some(suffix);
+                            }
+                        } else {
+                            ui.weak(tr(english, "Unbound", "未绑定"));
+                            ui.label("");
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+        if let Some(suffix) = toggle {
+            // UI recovery remains available even for a key removed from the range.
+            if let Some(group) = self.state.dynamic_groups.get_mut(&suffix) {
+                let actions = slot_actions(group, &self.windows);
+                self.apply_actions(actions);
+                self.persist();
+            }
+        }
+    }
+
+    fn sync_preview_textures(&mut self, ctx: &egui::Context) {
+        for window in &self.windows {
+            let Some(preview) = &window.preview else {
+                continue;
+            };
+            if self.preview_pixels.get(&window.id) == Some(preview) {
+                continue;
+            }
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [preview.width, preview.height],
+                &preview.rgba,
+            );
+            let texture = ctx.load_texture(
+                format!("window-preview-{}", window.id),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.preview_pixels
+                .insert(window.id.clone(), preview.clone());
+            self.preview_textures.insert(window.id.clone(), texture);
+        }
+        let live_ids: HashSet<_> = self
+            .windows
+            .iter()
+            .filter(|window| window.preview.is_some())
+            .map(|window| window.id.as_str())
+            .collect();
+        self.preview_textures
+            .retain(|window_id, _| live_ids.contains(window_id.as_str()));
+        self.preview_pixels
+            .retain(|window_id, _| live_ids.contains(window_id.as_str()));
+    }
 }
 
 impl eframe::App for VeilKeyApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Ok(windows) = NativeWindowController::enumerate_fast() {
+            self.windows = windows;
+        }
+        let actions = restore_session_groups(
+            self.state
+                .groups
+                .iter_mut()
+                .chain(self.state.dynamic_groups.values_mut())
+                .chain(self.dynamic_recovery.iter_mut()),
+            &self.windows,
+        );
+        if let Err(error) = NativeWindowController::apply_actions(actions) {
+            eprintln!("Could not restore all windows while exiting: {error}");
+        }
+        self.state.dynamic_groups.clear();
+        self.persist();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.process_tray_commands(ctx);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if ctx.input(|input| input.viewport().close_requested())
+            && self.tray_icon.is_some()
+            && !self.on_exit_requested()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         self.update_window_snapshot();
         self.update_window_actions();
         self.update_capture_listener_status();
@@ -1128,6 +1836,8 @@ impl eframe::App for VeilKeyApp {
         self.complete_focused_window_bindings(self.state.english_ui);
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
+        self.process_dynamic_toggle_results(self.state.english_ui);
+        self.sync_preview_textures(ctx);
         ctx.request_repaint_after(Duration::from_millis(100));
         let english = self.state.english_ui;
         let displayable_count = self
@@ -1137,24 +1847,16 @@ impl eframe::App for VeilKeyApp {
             .count();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
                 ui.heading("VeilKey");
-                ui.add_space(8.0);
-                ui.label(
-                    egui::RichText::new(tr(english, "WINDOW GROUPS", "窗口快捷管理"))
-                        .small()
-                        .color(egui::Color32::from_rgb(120, 165, 185)),
-                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button(tr(english, "中文", "English")).clicked() {
                         self.state.english_ui = !self.state.english_ui;
                         self.persist();
                     }
-                    if ui.button(tr(english, "Settings", "设置")).clicked() {
-                        self.settings_open = !self.settings_open;
-                    }
                     if ui.button(tr(english, "Refresh", "刷新窗口")).clicked() {
-                        request_window_refresh(&self.refresh_tx);
+                        request_window_refresh(&self.refresh_tx, true);
                     }
                     ui.label(if english {
                         format!("{displayable_count} windows")
@@ -1163,50 +1865,45 @@ impl eframe::App for VeilKeyApp {
                     });
                 });
             });
+            ui.add_space(8.0);
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.settings_open {
-                ui.horizontal(|ui| {
-                    ui.heading(tr(english, "Settings", "设置"));
-                    ui.label(tr(english, "Binding mode", "绑定方式"));
-                    let list_mode = self.state.bind_mode == BindMode::SelectFromList;
-                    if ui
-                        .selectable_label(list_mode, tr(english, "Select", "列表多选"))
-                        .clicked()
-                    {
-                        self.state.bind_mode = BindMode::SelectFromList;
-                        self.persist();
+        egui::CentralPanel::default()
+            .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
+            .show(ctx, |ui| {
+            let old_mode = self.state.bind_mode;
+            ui.horizontal(|ui| {
+                for (mode, en, zh) in [
+                    (BindMode::OneWindowAtATime, "Single window", "单窗口"),
+                    (BindMode::ActiveApplication, "Application windows", "同应用窗口"),
+                    (BindMode::SelectFromList, "Window combination", "多窗口组合"),
+                ] {
+                    if ui.add_sized([144.0, 36.0], egui::Button::new(tr(english, en, zh))
+                        .selected(self.state.bind_mode == mode)).clicked() {
+                        self.state.bind_mode = mode;
                     }
-                    if ui
-                        .selectable_label(
-                            !list_mode,
-                            tr(english, "One window at a time", "逐个绑定"),
-                        )
-                        .clicked()
-                    {
-                        self.state.bind_mode = BindMode::OneWindowAtATime;
-                        self.persist();
-                    }
-                    if ui
-                        .button(tr(english, "Bind focused window…", "绑定当前前台窗口…"))
-                        .clicked()
-                    {
-                        self.arm_focused_window_binding(english);
-                    }
-                    ui.label(tr(
-                        english,
-                        "Language is saved automatically.",
-                        "语言会自动保存。",
-                    ));
-                });
-                ui.separator();
+                }
+            });
+            if self.state.bind_mode != old_mode {
+                if self.dynamic_toggle_in_flight || self.action_in_flight {
+                    self.state.bind_mode = old_mode;
+                    self.state.status = "请等待当前窗口操作完成。".into();
+                } else if self.register_dynamic_hotkeys() {
+                    self.recording_group = None;
+                    self.pending_bind_group = None;
+                    self.capture_armed.store(false, Ordering::Release);
+                    self.persist();
+                } else {
+                    self.state.bind_mode = old_mode;
+                }
             }
+            ui.add_space(12.0);
+            ui.separator();
             if !self.state.status.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(
                         egui::RichText::new(localized_status(english, &self.state.status))
-                            .color(egui::Color32::from_rgb(235, 182, 95)),
+                            .color(ui.visuals().text_color()),
                     );
                     if ui.small_button("×").clicked() {
                         self.state.status.clear();
@@ -1214,14 +1911,13 @@ impl eframe::App for VeilKeyApp {
                 });
                 ui.add_space(4.0);
             }
+            if self.state.bind_mode.is_dynamic() {
+                self.dynamic_ui(ui, english);
+                return;
+            }
             ui.columns(2, |columns| {
                 let ui = &mut columns[0];
                 ui.heading(tr(english, "Window groups", "窗口组"));
-                ui.label(tr(
-                    english,
-                    "Create a group, then use one shortcut to show or hide it.",
-                    "把窗口加入组，再用一个快捷键统一显示或隐藏。",
-                ));
                 ui.add_space(8.0);
                 if self.state.groups.is_empty() {
                     ui.label(
@@ -1242,6 +1938,14 @@ impl eframe::App for VeilKeyApp {
                     ui.horizontal(|ui| {
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(&group.name).strong());
+                            ui.label(egui::RichText::new(group.hotkey.as_deref()
+                                .unwrap_or(tr(english, "Unassigned", "未绑定快捷键"))).monospace());
+                            for id in &group.window_ids {
+                                ui.label(self.windows.iter().find(|w| &w.id == id)
+                                    .map(|w| format!("{} · {}", w.app, w.title))
+                                    .unwrap_or_else(|| id.split('\0').take(2)
+                                        .collect::<Vec<_>>().join(" · ")));
+                            }
                             ui.label(format!(
                                 "{} {} · {}",
                                 group.window_ids.len(),
@@ -1321,16 +2025,16 @@ impl eframe::App for VeilKeyApp {
                             &mut group.macos_hide_application,
                             tr(
                                 english,
-                                "Hide whole app instead of minimizing",
-                                "隐藏整个应用，不最小化窗口",
+                            "Hide whole app instead of minimizing (Dock icon stays)",
+                                "隐藏整个应用、不最小化窗口（保留程序坞图标）",
                             ),
                         ),
                     );
                     let hide_application_changed = hide_application.changed();
                     hide_application.on_hover_text(tr(
                         english,
-                        "macOS only. Hides every window of each app in this group. The app icon remains in the Dock; this avoids minimized-window tiles. Change this option while the group is shown.",
-                        "仅 macOS。会隐藏组内每个应用的全部窗口，应用图标仍保留在程序坞；可避免出现最小化窗口缩略项。请在窗口组显示时调整。",
+                        "macOS only. Hides all windows of each application. App icons remain in the Dock. Change this option while the group is shown.",
+                        "仅 macOS。隐藏每个应用的全部窗口；应用图标仍保留在程序坞。请在窗口组显示时调整。",
                     ));
                     if hide_application_changed {
                         group_option_changed = true;
@@ -1366,6 +2070,39 @@ impl eframe::App for VeilKeyApp {
                     "Only visible windows with a usable preview are listed.",
                     "这里只显示当前可见且有实际尺寸的窗口。",
                 ));
+                #[cfg(target_os = "macos")]
+                if !NativeWindowController::screen_capture_authorized() {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(210, 132, 66),
+                            tr(
+                                english,
+                                "Window previews require Screen Recording permission.",
+                                "窗口预览需要“屏幕录制”权限。",
+                            ),
+                        );
+                        if ui
+                            .button(tr(english, "Grant permission", "请求授权"))
+                            .clicked()
+                        {
+                            let granted = NativeWindowController::request_screen_capture_access();
+                            self.state.status = if granted {
+                                tr(
+                                    english,
+                                    "Screen Recording permission granted. Restart VeilKey to load previews.",
+                                    "已获得屏幕录制权限，请重启 VeilKey 以加载预览图。",
+                                )
+                            } else {
+                                tr(
+                                    english,
+                                    "Allow VeilKey under Privacy & Security → Screen Recording, then restart it.",
+                                    "请在“隐私与安全性 → 屏幕录制”中允许 VeilKey，然后重启应用。",
+                                )
+                            }
+                            .into();
+                        }
+                    });
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.label(tr(english, "Name", "组名"));
@@ -1435,6 +2172,12 @@ impl eframe::App for VeilKeyApp {
                                     }
                                 }
                                 ui.vertical(|ui| {
+                                    if let Some(texture) = self.preview_textures.get(&window.id) {
+                                        ui.add(
+                                            egui::Image::new(texture)
+                                                .max_size(egui::vec2(144.0, 100.0)),
+                                        );
+                                    }
                                     ui.label(egui::RichText::new(&window.title).strong());
                                     ui.label(format!(
                                         "{} · {}×{}",
@@ -1488,6 +2231,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
             .with_min_inner_size([780.0, 520.0]),
+        #[cfg(target_os = "macos")]
+        event_loop_builder: Some(Box::new(|builder| {
+            use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+            builder.with_activation_policy(ActivationPolicy::Accessory);
+        })),
         ..Default::default()
     };
     let state_file = state_path();
@@ -1506,13 +2254,161 @@ fn main() -> eframe::Result {
     eframe::run_native(
         "VeilKey",
         options,
-        Box::new(move |_cc| Ok(Box::new(VeilKeyApp::new(instance_lock)))),
+        Box::new(move |cc| {
+            configure_ui(&cc.egui_ctx);
+            #[cfg(target_os = "macos")]
+            configure_macos_cjk_fonts(&cc.egui_ctx);
+            #[cfg(target_os = "windows")]
+            configure_windows_cjk_fonts(&cc.egui_ctx);
+            Ok(Box::new(VeilKeyApp::new(instance_lock, &cc.egui_ctx)))
+        }),
     )
+}
+
+fn configure_ui(ctx: &egui::Context) {
+    let mut style = (*ctx.style()).clone();
+    style.spacing.item_spacing = egui::vec2(12.0, 10.0);
+    style.spacing.button_padding = egui::vec2(12.0, 7.0);
+    style.spacing.interact_size.y = 32.0;
+    for (text_style, size) in [
+        (egui::TextStyle::Body, 16.0),
+        (egui::TextStyle::Button, 15.0),
+        (egui::TextStyle::Small, 13.0),
+        (egui::TextStyle::Monospace, 15.0),
+        (egui::TextStyle::Heading, 20.0),
+    ] {
+        style
+            .text_styles
+            .insert(text_style, egui::FontId::proportional(size));
+    }
+    ctx.set_style(style);
+}
+
+#[cfg(target_os = "macos")]
+fn configure_macos_cjk_fonts(ctx: &egui::Context) {
+    let candidates = [
+        "/System/Library/Fonts/Hiragino Sans GB.ttc",
+        "/System/Library/Fonts/PingFang.ttc",
+        "/System/Library/Fonts/STHeiti Medium.ttc",
+    ];
+    let Some((path, bytes)) = candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (*path, bytes)))
+    else {
+        eprintln!("No supported macOS Chinese font was found; Chinese text may be missing.");
+        return;
+    };
+
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "macos_cjk".into(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("macos_cjk".into());
+    }
+    eprintln!("Using macOS Chinese font: {path}");
+    ctx.set_fonts(fonts);
+}
+
+#[cfg(target_os = "windows")]
+fn configure_windows_cjk_fonts(ctx: &egui::Context) {
+    let windows_dir = std::env::var_os("WINDIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
+    let candidates = [
+        windows_dir.join(r"Fonts\msyh.ttc"),
+        windows_dir.join(r"Fonts\msyh.ttf"),
+        windows_dir.join(r"Fonts\simhei.ttf"),
+    ];
+    let Some((path, bytes)) = candidates
+        .iter()
+        .find_map(|path| std::fs::read(path).ok().map(|bytes| (path, bytes)))
+    else {
+        eprintln!("No supported Windows Chinese font was found; Chinese text may be missing.");
+        return;
+    };
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "windows_cjk".into(),
+        std::sync::Arc::new(egui::FontData::from_owned(bytes)),
+    );
+    for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
+        fonts
+            .families
+            .entry(family)
+            .or_default()
+            .push("windows_cjk".into());
+    }
+    eprintln!("Using Windows Chinese font: {}", path.display());
+    ctx.set_fonts(fonts);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn suffix_form_accepts_compact_reference_format_and_function_keys() {
+        assert_eq!(
+            parse_suffix_input("90-=").unwrap(),
+            ["Digit9", "Digit0", "Minus", "Equal"]
+        );
+        assert_eq!(
+            parse_suffix_input("a B, F1 f12，0 a").unwrap(),
+            ["KeyA", "KeyB", "F1", "F12", "Digit0"]
+        );
+        for invalid in ["", "   ", "中文", "F13", "9 /"] {
+            assert!(parse_suffix_input(invalid).is_err(), "{invalid}");
+        }
+        assert_eq!(suffix_input(&["KeyU".into()]), "u");
+    }
+
+    #[test]
+    fn only_bound_groups_appear_in_the_session_binding_list() {
+        let mut bound = group("Bound", "super+KeyU");
+        bound.window_ids.insert("window-1".into());
+        let unbound = group("Empty slot", "super+KeyI");
+        assert!(is_bound_in_session(&bound));
+        assert!(!is_bound_in_session(&unbound));
+    }
+
+    #[test]
+    fn shortcut_labels_use_platform_names_and_round_trip_suffixes() {
+        let keys = vec![
+            "Digit9".into(),
+            "Digit0".into(),
+            "Minus".into(),
+            "F12".into(),
+        ];
+        assert_eq!(parse_suffix_input(&suffix_input(&keys)).unwrap(), keys);
+        let modifiers = vec!["super".into(), "shift".into()];
+        assert_eq!(
+            readable_shortcut(&modifiers, "Digit9", true),
+            "Command + Shift + 9"
+        );
+        assert_eq!(
+            readable_shortcut(&modifiers, "Digit9", false),
+            "Win + Shift + 9"
+        );
+        assert_eq!(
+            readable_shortcut(&["super".into()], "KeyU", true),
+            "Command + u"
+        );
+        let modifiers = vec!["ctrl".into(), "alt".into()];
+        assert_eq!(
+            readable_shortcut(&modifiers, "F12", true),
+            "Control + Option + F12"
+        );
+        assert_eq!(
+            readable_shortcut(&modifiers, "F12", false),
+            "Ctrl + Alt + F12"
+        );
+    }
 
     fn group(name: &str, hotkey: &str) -> Group {
         Group {
@@ -1540,30 +2436,6 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_conflicts_are_retried_but_invalid_bindings_are_terminal() {
-        let hotkey = HotKey::from_str("ctrl+alt+KeyH").unwrap();
-        assert!(hotkey_registration_is_retryable(
-            &global_hotkey::Error::AlreadyRegistered(hotkey)
-        ));
-        assert!(!hotkey_registration_is_retryable(
-            &global_hotkey::Error::FailedToRegister("unsupported key".into())
-        ));
-        assert!(hotkey_registration_is_retryable(
-            &global_hotkey::Error::OsError(std::io::Error::from(std::io::ErrorKind::Other))
-        ));
-    }
-
-    #[test]
-    fn shortcut_retry_backoff_grows_to_a_five_minute_cap() {
-        assert_eq!(hotkey_retry_delay(0), Duration::from_secs(5));
-        assert_eq!(hotkey_retry_delay(1), Duration::from_secs(10));
-        assert_eq!(hotkey_retry_delay(2), Duration::from_secs(20));
-        assert_eq!(hotkey_retry_delay(5), Duration::from_secs(160));
-        assert_eq!(hotkey_retry_delay(6), Duration::from_secs(300));
-        assert_eq!(hotkey_retry_delay(20), Duration::from_secs(300));
-    }
-
-    #[test]
     fn capture_listener_retry_uses_capped_exponential_backoff() {
         assert_eq!(capture_retry_delay(0), Duration::from_secs(2));
         assert_eq!(capture_retry_delay(1), Duration::from_secs(2));
@@ -1587,81 +2459,11 @@ mod tests {
     #[test]
     fn window_refresh_requests_are_coalesced_when_the_worker_is_busy() {
         let (sender, receiver) = mpsc::sync_channel(1);
-        request_window_refresh(&sender);
-        request_window_refresh(&sender);
-        request_window_refresh(&sender);
+        request_window_refresh(&sender, false);
+        request_window_refresh(&sender, true);
+        request_window_refresh(&sender, true);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn poisoned_native_window_lock_is_recovered_for_later_calls() {
-        let lock = NativeWindowLock::new();
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            with_native_window_lock(&lock, || panic!("simulated native API fault"));
-        }));
-        assert!(result.is_err());
-        assert_eq!(with_native_window_lock(&lock, || 42), 42);
-    }
-
-    #[test]
-    fn snapshots_from_during_or_before_window_operations_are_discarded() {
-        assert!(snapshot_is_current(4, 4));
-        assert!(!snapshot_is_current(3, 3));
-        assert!(!snapshot_is_current(2, 4));
-        assert!(!snapshot_is_current(4, 5));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn stale_or_missing_window_snapshots_require_refresh_before_toggle() {
-        let now = Instant::now();
-        assert!(snapshot_is_fresh(Some(now), now));
-        assert!(snapshot_is_fresh(
-            Some(now - Duration::from_millis(250)),
-            now
-        ));
-        assert!(!snapshot_is_fresh(
-            Some(now - Duration::from_millis(251)),
-            now
-        ));
-        assert!(!snapshot_is_fresh(None, now));
-    }
-
-    #[test]
-    fn panicking_window_operation_recovers_snapshot_generation_and_returns_error() {
-        let generation = AtomicU64::new(0);
-        let (generation, applied, snapshot) =
-            run_protected_window_operation(&generation, || panic!("simulated worker fault"));
-
-        assert_eq!(generation, 2);
-        assert!(snapshot_is_current(generation, generation));
-        assert!(applied.unwrap_err().contains("simulated worker fault"));
-        assert!(snapshot.is_err());
-    }
-
-    #[test]
-    fn panicking_window_enumeration_returns_an_error_and_later_calls_can_succeed() {
-        let failed: Result<Vec<WindowInfo>, _> =
-            enumerate_windows_resiliently(|| panic!("simulated enumeration fault"));
-        assert!(failed.unwrap_err().contains("simulated enumeration fault"));
-
-        let recovered = enumerate_windows_resiliently(|| Ok(Vec::new()));
-        assert_eq!(recovered.unwrap(), Vec::<WindowInfo>::new());
-    }
-
-    #[test]
-    fn panicking_focused_window_lookup_returns_a_completion_error() {
-        let (focused, windows) =
-            lookup_focused_window_resiliently(|| panic!("simulated focused-window fault"));
-
-        assert!(
-            focused
-                .unwrap_err()
-                .contains("simulated focused-window fault")
-        );
-        assert!(windows.is_err());
     }
 
     #[test]
@@ -1686,5 +2488,192 @@ mod tests {
         let groups_after_delete = [group("Target", "ctrl+alt+KeyB")];
         assert_eq!(group_index_by_name(&groups_after_delete, "Target"), Some(0));
         assert_eq!(group_index_by_name(&groups_after_delete, "Deleted"), None);
+    }
+
+    #[test]
+    fn selected_modifiers_form_one_shortcut_per_suffix() {
+        let state = AppState {
+            bind_mode: BindMode::OneWindowAtATime,
+            ..Default::default()
+        };
+        let roles = plan_dynamic_hotkeys(&state).unwrap();
+        assert_eq!(roles.len(), 4);
+        for suffix in &state.dynamic_suffixes {
+            let roles: Vec<_> = roles.iter().filter(|role| &role.suffix == suffix).collect();
+            assert_eq!(roles.len(), 1);
+        }
+        let shift_combo = AppState {
+            dynamic_toggle_modifiers: vec!["super".into(), "shift".into()],
+            dynamic_suffixes: vec!["KeyU".into()],
+            bind_mode: BindMode::OneWindowAtATime,
+            ..Default::default()
+        };
+        let roles = plan_dynamic_hotkeys(&shift_combo).unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(
+            roles[0].hotkey,
+            HotKey::from_str("super+shift+KeyU").unwrap()
+        );
+    }
+
+    #[test]
+    fn dynamic_hotkey_uses_exactly_the_selected_modifier_combination() {
+        let state = AppState {
+            bind_mode: BindMode::OneWindowAtATime,
+            dynamic_toggle_modifiers: vec!["super".into(), "shift".into()],
+            dynamic_suffixes: vec!["KeyU".into()],
+            ..Default::default()
+        };
+        let roles = plan_dynamic_hotkeys(&state).unwrap();
+        assert_eq!(roles.len(), 1);
+        assert_eq!(
+            roles[0].hotkey,
+            HotKey::from_str("super+shift+KeyU").unwrap()
+        );
+    }
+
+    #[test]
+    fn shortcut_range_rejects_overlap_duplicates_empty_keys_and_manual_conflicts() {
+        let mut state = AppState {
+            bind_mode: BindMode::ActiveApplication,
+            ..Default::default()
+        };
+        assert!(plan_dynamic_hotkeys(&state).is_ok());
+        state.dynamic_toggle_modifiers.push("shift".into());
+        let combined = plan_dynamic_hotkeys(&state).unwrap();
+        assert!(combined.iter().all(|role| {
+            role.hotkey
+                .mods
+                .contains(global_hotkey::hotkey::Modifiers::SHIFT)
+        }));
+        state.dynamic_suffixes = vec![];
+        assert!(plan_dynamic_hotkeys(&state).is_err());
+        state.dynamic_suffixes = vec!["Digit9".into()];
+        state
+            .groups
+            .push(group("Conflicting", "super+shift+Digit9"));
+        assert!(plan_dynamic_hotkeys(&state).is_err());
+        state.groups.clear();
+        state.dynamic_toggle_modifiers.clear();
+        assert!(plan_dynamic_hotkeys(&state).is_err());
+    }
+
+    #[test]
+    fn stored_slot_toggles_without_any_foreground_target() {
+        let mut first = group("First", "super+Digit9");
+        first.window_ids.insert("first".into());
+        first.is_visible = false;
+        let windows = [WindowInfo {
+            id: "first".into(),
+            title: "First".into(),
+            app: "Example".into(),
+            rect: Default::default(),
+            visible: false,
+            native_handle: 42,
+            process_id: 10,
+            preview: None,
+        }];
+        assert!(!should_bind_slot(Some(&first), Some("other-app"), &windows));
+        let actions = slot_actions(&mut first, &windows);
+        assert!(matches!(
+            actions.as_slice(),
+            [WindowAction::SetVisible {
+                visible: true,
+                handle: 42,
+                ..
+            }]
+        ));
+        assert!(first.is_visible);
+        let visible_windows = [WindowInfo {
+            visible: true,
+            ..windows[0].clone()
+        }];
+        assert!(!should_bind_slot(
+            Some(&first),
+            Some("first"),
+            &visible_windows
+        ));
+        assert!(should_bind_slot(
+            Some(&first),
+            Some("other-app"),
+            &visible_windows
+        ));
+        assert!(should_bind_slot(None, Some("first"), &visible_windows));
+    }
+
+    #[test]
+    fn replacing_slot_only_restores_hidden_old_windows() {
+        let mut old = group("Old target", "super+Digit9");
+        old.window_ids.extend(["hidden".into(), "visible".into()]);
+        let windows = [false, true].map(|visible| WindowInfo {
+            id: if visible { "visible" } else { "hidden" }.into(),
+            title: String::new(),
+            app: String::new(),
+            rect: Default::default(),
+            visible,
+            native_handle: if visible { 2 } else { 1 },
+            process_id: 10,
+            preview: None,
+        });
+        assert!(matches!(
+            restore_group_actions(&old, &windows).as_slice(),
+            [WindowAction::SetVisible {
+                visible: true,
+                handle: 1,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
+    fn session_exit_restores_hidden_windows_and_clears_group_hidden_state() {
+        let mut hidden = group("Hidden target", "super+Digit9");
+        hidden.window_ids.insert("hidden-window".into());
+        hidden.is_visible = false;
+        let windows = [WindowInfo {
+            id: "hidden-window".into(),
+            title: "Hidden target".into(),
+            app: "Example".into(),
+            rect: Default::default(),
+            visible: false,
+            native_handle: 77,
+            process_id: 10,
+            preview: None,
+        }];
+
+        let actions = restore_session_groups([&mut hidden].into_iter(), &windows);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [WindowAction::SetVisible {
+                visible: true,
+                handle: 77,
+                ..
+            }]
+        ));
+        assert!(hidden.is_visible);
+    }
+
+    #[test]
+    fn successful_unrelated_action_keeps_failed_rebind_recovery() {
+        let mut old = group("Failed restoration", "super+Digit9");
+        old.window_ids.insert("old".into());
+        old.is_visible = false;
+        let mut recovery = vec![old];
+        let mut windows = vec![WindowInfo {
+            id: "old".into(),
+            title: String::new(),
+            app: String::new(),
+            rect: Default::default(),
+            visible: false,
+            native_handle: 1,
+            process_id: 1,
+            preview: None,
+        }];
+        retain_unrestored_targets(&mut recovery, &windows);
+        assert_eq!(recovery.len(), 1);
+        windows[0].visible = true;
+        retain_unrestored_targets(&mut recovery, &windows);
+        assert!(recovery.is_empty());
     }
 }

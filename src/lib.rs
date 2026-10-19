@@ -23,6 +23,33 @@ pub struct WindowInfo {
     pub rect: Rect,
     pub visible: bool,
     pub native_handle: isize,
+    pub process_id: u32,
+    pub preview: Option<WindowPreview>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WindowPreview {
+    pub width: usize,
+    pub height: usize,
+    pub rgba: Vec<u8>,
+}
+
+pub fn bgra_to_rgba(mut pixels: Vec<u8>) -> Vec<u8> {
+    for pixel in pixels.chunks_exact_mut(4) {
+        pixel.swap(0, 2);
+    }
+    pixels
+}
+
+impl WindowPreview {
+    pub fn new(width: usize, height: usize, rgba: Vec<u8>) -> Option<Self> {
+        let expected_len = width.checked_mul(height)?.checked_mul(4)?;
+        (width > 0 && height > 0 && rgba.len() == expected_len).then_some(Self {
+            width,
+            height,
+            rgba,
+        })
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -41,9 +68,15 @@ pub struct Group {
     pub restore_rects: BTreeMap<String, Rect>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
     pub groups: Vec<Group>,
+    #[serde(default, skip)]
+    pub dynamic_groups: BTreeMap<String, Group>,
+    #[serde(default = "default_dynamic_toggle_modifiers")]
+    pub dynamic_toggle_modifiers: Vec<String>,
+    #[serde(default = "default_dynamic_suffixes")]
+    pub dynamic_suffixes: Vec<String>,
     #[serde(default)]
     pub english_ui: bool,
     #[serde(default)]
@@ -56,16 +89,128 @@ pub struct AppState {
     pub status: String,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            groups: Vec::new(),
+            dynamic_groups: BTreeMap::new(),
+            dynamic_toggle_modifiers: default_dynamic_toggle_modifiers(),
+            dynamic_suffixes: default_dynamic_suffixes(),
+            english_ui: false,
+            bind_mode: BindMode::default(),
+            selected_windows: Default::default(),
+            new_group_name: String::new(),
+            status: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BindMode {
     #[default]
     SelectFromList,
     OneWindowAtATime,
+    ActiveApplication,
+}
+
+fn default_dynamic_toggle_modifiers() -> Vec<String> {
+    vec!["super".into()]
+}
+
+fn default_dynamic_suffixes() -> Vec<String> {
+    ["Digit9", "Digit0", "Minus", "Equal"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
+}
+
+pub fn dynamic_hotkey_combinations(modifiers: &[String], suffixes: &[String]) -> Vec<String> {
+    let mut modifiers: Vec<_> = modifiers
+        .iter()
+        .map(|modifier| modifier.to_ascii_lowercase())
+        .collect();
+    modifiers.sort();
+    modifiers.dedup();
+    let suffixes: Vec<_> = suffixes
+        .iter()
+        .map(|suffix| suffix.trim().to_owned())
+        .filter(|suffix| !suffix.is_empty())
+        .collect();
+    let mut suffixes = suffixes;
+    let mut seen = BTreeSet::new();
+    suffixes.retain(|suffix| seen.insert(suffix.clone()));
+    suffixes
+        .into_iter()
+        .map(|suffix| {
+            if modifiers.is_empty() {
+                suffix
+            } else {
+                format!("{}+{suffix}", modifiers.join("+"))
+            }
+        })
+        .collect()
+}
+
+impl BindMode {
+    pub fn is_dynamic(self) -> bool {
+        matches!(self, Self::OneWindowAtATime | Self::ActiveApplication)
+    }
 }
 
 pub fn window_is_displayable(window: &WindowInfo) -> bool {
     window.visible && window.rect.width > 1 && window.rect.height > 1
+}
+
+pub fn dynamic_target_ids(
+    mode: BindMode,
+    focused_window_id: &str,
+    windows: &[WindowInfo],
+) -> Option<Vec<String>> {
+    let focused = windows
+        .iter()
+        .find(|window| window.id == focused_window_id && window_is_displayable(window))?;
+    match mode {
+        BindMode::OneWindowAtATime => Some(vec![focused.id.clone()]),
+        BindMode::ActiveApplication => Some(
+            windows
+                .iter()
+                .filter(|window| {
+                    window.process_id == focused.process_id && window_is_displayable(window)
+                })
+                .map(|window| window.id.clone())
+                .collect(),
+        ),
+        BindMode::SelectFromList => None,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DynamicTransition {
+    pub show_ids: Vec<String>,
+    pub hide_ids: Vec<String>,
+}
+
+pub fn dynamic_transition(
+    mode: BindMode,
+    focused_window_id: &str,
+    windows: &[WindowInfo],
+    hidden_ids: &[String],
+) -> Option<DynamicTransition> {
+    let mut next_ids = dynamic_target_ids(mode, focused_window_id, windows)?;
+    next_ids.sort();
+    let mut current_hidden = hidden_ids.to_vec();
+    current_hidden.sort();
+    if next_ids == current_hidden {
+        return Some(DynamicTransition {
+            show_ids: current_hidden,
+            hide_ids: Vec::new(),
+        });
+    }
+    Some(DynamicTransition {
+        show_ids: current_hidden,
+        hide_ids: next_ids,
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,7 +334,7 @@ impl AppState {
     }
 }
 
-fn same_window_id(current: &str, saved: &str) -> bool {
+pub fn same_window_id(current: &str, saved: &str) -> bool {
     if current == saved {
         return true;
     }
@@ -363,6 +508,8 @@ mod tests {
             },
             visible: true,
             native_handle: handle,
+            process_id: 1,
+            preview: None,
         }
     }
 
@@ -726,5 +873,103 @@ mod tests {
         assert!(window_is_displayable(&visible));
         assert!(!window_is_displayable(&hidden));
         assert!(!window_is_displayable(&empty));
+    }
+
+    #[test]
+    fn window_preview_rejects_incomplete_rgba_buffers() {
+        assert!(WindowPreview::new(2, 1, vec![0; 8]).is_some());
+        assert!(WindowPreview::new(2, 1, vec![0; 7]).is_none());
+        assert!(WindowPreview::new(0, 1, Vec::new()).is_none());
+    }
+
+    #[test]
+    fn thumbnail_bgra_conversion_preserves_alpha_and_swaps_red_blue() {
+        assert_eq!(bgra_to_rgba(vec![10, 20, 30, 255]), vec![30, 20, 10, 255]);
+    }
+
+    #[test]
+    fn dynamic_window_mode_targets_only_the_focused_window() {
+        let windows = [
+            sample_window("focused", 1, 0),
+            sample_window("sibling", 2, 800),
+        ];
+        assert_eq!(
+            dynamic_target_ids(BindMode::OneWindowAtATime, "focused", &windows),
+            Some(vec!["focused".to_owned()])
+        );
+    }
+
+    #[test]
+    fn dynamic_application_mode_targets_visible_windows_from_same_process() {
+        let windows = [
+            WindowInfo {
+                id: "focused".into(),
+                process_id: 100,
+                ..sample_window("focused", 1, 0)
+            },
+            WindowInfo {
+                id: "sibling".into(),
+                process_id: 100,
+                ..sample_window("sibling", 2, 800)
+            },
+            WindowInfo {
+                id: "other-app".into(),
+                process_id: 200,
+                ..sample_window("other-app", 3, 1600)
+            },
+        ];
+        assert_eq!(
+            dynamic_target_ids(BindMode::ActiveApplication, "focused", &windows),
+            Some(vec!["focused".to_owned(), "sibling".to_owned()])
+        );
+    }
+
+    #[test]
+    fn only_manual_multi_window_mode_is_not_dynamic() {
+        assert!(!BindMode::SelectFromList.is_dynamic());
+        assert!(BindMode::OneWindowAtATime.is_dynamic());
+        assert!(BindMode::ActiveApplication.is_dynamic());
+    }
+
+    #[test]
+    fn fresh_install_and_legacy_settings_have_same_shortcut_range() {
+        let fresh = AppState::default();
+        let legacy: AppState = serde_json::from_str(r#"{"groups":[]}"#).unwrap();
+        assert_eq!(fresh.dynamic_suffixes, legacy.dynamic_suffixes);
+        assert!(!fresh.dynamic_suffixes.is_empty());
+    }
+
+    #[test]
+    fn shortcut_suffixes_are_deduplicated_without_reordering() {
+        assert_eq!(
+            dynamic_hotkey_combinations(
+                &["super".into()],
+                &["Digit9".into(), "Digit0".into(), "Digit9".into()]
+            ),
+            vec!["super+Digit9", "super+Digit0"]
+        );
+    }
+
+    #[test]
+    fn dynamic_hotkey_reveals_same_target_and_restores_old_target_on_switch() {
+        let windows = [
+            sample_window("first", 1, 0),
+            sample_window("second", 2, 800),
+        ];
+        let hidden = vec!["first".to_owned()];
+        assert_eq!(
+            dynamic_transition(BindMode::OneWindowAtATime, "first", &windows, &hidden),
+            Some(DynamicTransition {
+                show_ids: vec!["first".into()],
+                hide_ids: vec![],
+            })
+        );
+        assert_eq!(
+            dynamic_transition(BindMode::OneWindowAtATime, "second", &windows, &hidden),
+            Some(DynamicTransition {
+                show_ids: vec!["first".into()],
+                hide_ids: vec!["second".into()],
+            })
+        );
     }
 }

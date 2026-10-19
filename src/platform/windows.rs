@@ -28,6 +28,26 @@ struct RawWindow {
 pub struct NativeWindowController;
 
 impl NativeWindowController {
+    pub fn focused_window_snapshot(
+        _additional_window_ids: &[String],
+    ) -> Result<(Option<String>, Vec<WindowInfo>), String> {
+        let focused = Self::foreground_window_id()?;
+        let windows = Self::enumerate_fast()?;
+        Ok((focused, windows))
+    }
+
+    pub fn enumerate_fast() -> Result<Vec<WindowInfo>, String> {
+        Self::enumerate()
+    }
+
+    pub fn screen_capture_authorized() -> bool {
+        true
+    }
+
+    pub fn request_screen_capture_access() -> bool {
+        true
+    }
+
     pub fn foreground_window_id() -> Result<Option<String>, String> {
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.0.is_null() {
@@ -126,6 +146,8 @@ impl NativeWindowController {
                     rect: w.rect,
                     visible,
                     native_handle: w.hwnd.0 as isize,
+                    process_id: w.pid,
+                    preview: None,
                 }
             })
             .collect())
@@ -492,6 +514,15 @@ mod tests {
                 assert!(ids.insert(window.id));
             }
         }
+    }
+
+    #[test]
+    fn windows_preview_controller_exposes_fast_snapshot_and_capture_access() {
+        assert!(NativeWindowController::screen_capture_authorized());
+        assert!(NativeWindowController::request_screen_capture_access());
+        let (_, windows) = NativeWindowController::focused_window_snapshot(&[])
+            .expect("read foreground and window snapshot");
+        assert!(!windows.iter().any(|window| window.preview.is_some()));
     }
 
     #[test]

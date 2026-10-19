@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Refresh stale Windows window state before applying a shortcut toggle, so changes made externally between polling intervals do not drive actions from an old visibility snapshot.
 - Serialize Windows desktop enumeration, focused-window lookup, and window-group changes through one poison-tolerant native API lock to avoid overlapping window-state reads and mutations.
 - Retry temporarily occupied shortcuts and OS registration errors with capped exponential backoff, while treating invalid or unsupported bindings as terminal errors.
 - Recover the Windows window-operation worker from a per-operation panic, restore snapshot generation state, and report the failure instead of leaving shortcuts permanently busy.

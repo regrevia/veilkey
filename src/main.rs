@@ -33,6 +33,7 @@ fn localized_status(english: bool, status: &str) -> String {
         "Shortcuts recovered." => "快捷键已恢复。".into(),
         "Keyboard listener recovered." => "全局按键监听已恢复。".into(),
         "Window operation is already in progress." => "窗口操作正在执行，请稍候。".into(),
+        "Refreshing window state before toggling." => "正在刷新窗口状态，然后执行切换。".into(),
         "Window operation worker stopped." => "窗口操作服务已停止，请重启应用。".into(),
         "Too many window shortcuts are queued." => "窗口快捷键请求过多，部分请求已忽略。".into(),
         "Press the shortcut now." => "请按下要绑定的快捷键。".into(),
@@ -125,6 +126,20 @@ fn with_native_window_lock<T>(lock: &NativeWindowLock, operation: impl FnOnce() 
 
 fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
     snapshot_generation == current_generation && current_generation.is_multiple_of(2)
+}
+
+fn snapshot_is_fresh(snapshot_updated_at: Option<Instant>, now: Instant) -> bool {
+    #[cfg(windows)]
+    {
+        snapshot_updated_at.is_some_and(|updated_at| {
+            now.saturating_duration_since(updated_at) <= Duration::from_millis(250)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (snapshot_updated_at, now);
+        true
+    }
 }
 
 fn enumerate_windows_resiliently<F>(enumerate: F) -> Result<Vec<WindowInfo>, String>
@@ -352,6 +367,7 @@ fn hotkey_key_name(key: rdev::Key) -> Option<&'static str> {
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
+    snapshot_updated_at: Option<Instant>,
     window_rx: Receiver<(u64, Result<Vec<WindowInfo>, String>)>,
     snapshot_generation: Arc<AtomicU64>,
     native_window_lock: Arc<NativeWindowLock>,
@@ -378,6 +394,7 @@ struct VeilKeyApp {
     action_rx: Receiver<ActionCompletion>,
     action_in_flight: bool,
     queued_toggles: VecDeque<String>,
+    waiting_toggles: VecDeque<String>,
 }
 
 type ActionCompletion = (u64, Result<(), String>, Result<Vec<WindowInfo>, String>);
@@ -512,6 +529,7 @@ impl VeilKeyApp {
         let mut app = Self {
             state,
             windows: Vec::new(),
+            snapshot_updated_at: None,
             window_rx,
             snapshot_generation,
             native_window_lock,
@@ -538,6 +556,7 @@ impl VeilKeyApp {
             action_rx,
             action_in_flight: false,
             queued_toggles: VecDeque::new(),
+            waiting_toggles: VecDeque::new(),
         };
         app.register_saved_hotkeys();
         request_window_refresh(&app.refresh_tx);
@@ -679,9 +698,13 @@ impl VeilKeyApp {
             }
             if snapshot_is_current(generation, self.snapshot_generation.load(Ordering::Acquire)) {
                 match snapshot {
-                    Ok(windows) => self.windows = windows,
+                    Ok(windows) => {
+                        self.windows = windows;
+                        self.snapshot_updated_at = Some(Instant::now());
+                    }
                     Err(error) => {
                         self.queued_toggles.clear();
+                        self.waiting_toggles.clear();
                         if self.state.status.is_empty() {
                             self.state.status = error;
                         }
@@ -699,6 +722,7 @@ impl VeilKeyApp {
         {
             self.toggle_group_now(index);
         }
+        self.start_waiting_toggle_if_ready();
     }
 
     fn retry_hotkeys_if_needed(&mut self) {
@@ -977,19 +1001,48 @@ impl VeilKeyApp {
     }
 
     fn toggle_group(&mut self, index: usize) {
+        let Some(group_name) = self.state.groups.get(index).map(|group| group.name.clone()) else {
+            return;
+        };
         if self.action_in_flight {
             // Preserve the order of groups that may overlap; only adjacent repeated
             // toggles cancel while a native operation is pending.
-            let Some(group_name) = self.state.groups.get(index).map(|group| group.name.clone())
-            else {
-                return;
-            };
             if !enqueue_toggle(&mut self.queued_toggles, group_name, 16) {
                 self.state.status = "Too many window shortcuts are queued.".into();
             }
             return;
         }
+        if !self.waiting_toggles.is_empty()
+            || !snapshot_is_fresh(self.snapshot_updated_at, Instant::now())
+        {
+            if !enqueue_toggle(&mut self.waiting_toggles, group_name, 16) {
+                self.state.status = "Too many window shortcuts are queued.".into();
+                return;
+            }
+            self.state.status = "Refreshing window state before toggling.".into();
+            request_window_refresh(&self.refresh_tx);
+            return;
+        }
         self.toggle_group_now(index);
+    }
+
+    fn start_waiting_toggle_if_ready(&mut self) {
+        if self.action_in_flight || !snapshot_is_fresh(self.snapshot_updated_at, Instant::now()) {
+            return;
+        }
+        while let Some(group_name) = self.waiting_toggles.pop_front() {
+            if let Some(index) = self
+                .state
+                .groups
+                .iter()
+                .position(|group| group.name == group_name)
+            {
+                self.toggle_group_now(index);
+                if self.action_in_flight {
+                    break;
+                }
+            }
+        }
     }
 
     fn toggle_group_now(&mut self, index: usize) {
@@ -1039,8 +1092,13 @@ impl VeilKeyApp {
             match result {
                 Ok(windows) => {
                     self.windows = windows;
+                    self.snapshot_updated_at = Some(Instant::now());
+                    self.start_waiting_toggle_if_ready();
                 }
-                Err(error) => self.state.status = error,
+                Err(error) => {
+                    self.waiting_toggles.clear();
+                    self.state.status = error;
+                }
             }
         }
     }
@@ -1553,6 +1611,22 @@ mod tests {
         assert!(!snapshot_is_current(3, 3));
         assert!(!snapshot_is_current(2, 4));
         assert!(!snapshot_is_current(4, 5));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn stale_or_missing_window_snapshots_require_refresh_before_toggle() {
+        let now = Instant::now();
+        assert!(snapshot_is_fresh(Some(now), now));
+        assert!(snapshot_is_fresh(
+            Some(now - Duration::from_millis(250)),
+            now
+        ));
+        assert!(!snapshot_is_fresh(
+            Some(now - Duration::from_millis(251)),
+            now
+        ));
+        assert!(!snapshot_is_fresh(None, now));
     }
 
     #[test]

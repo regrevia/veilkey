@@ -248,7 +248,15 @@ fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(Stri
 }
 
 fn hotkey_registration_is_retryable(error: &global_hotkey::Error) -> bool {
-    matches!(error, global_hotkey::Error::OsError(_))
+    matches!(
+        error,
+        global_hotkey::Error::AlreadyRegistered(_) | global_hotkey::Error::OsError(_)
+    )
+}
+
+fn hotkey_retry_delay(attempts: u32) -> Duration {
+    Duration::from_secs(5_u64.saturating_mul(1_u64 << attempts.min(6)))
+        .min(Duration::from_secs(300))
 }
 
 fn group_index_by_name(groups: &[Group], name: &str) -> Option<usize> {
@@ -354,6 +362,7 @@ struct VeilKeyApp {
     filter: String,
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
+    hotkey_retry_attempts: u32,
     registered_hotkey_ids: HashSet<u32>,
     recording_group: Option<String>,
     settings_open: bool,
@@ -513,6 +522,7 @@ impl VeilKeyApp {
             filter: String::new(),
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
+            hotkey_retry_attempts: 0,
             registered_hotkey_ids: HashSet::new(),
             recording_group: None,
             settings_open: false,
@@ -625,13 +635,20 @@ impl VeilKeyApp {
                 self.persist();
             }
             Err(error) => {
-                self.hotkey_retry_needed = hotkey_registration_is_retryable(&error);
+                self.hotkey_retry_needed = false;
                 if let Some(old) = old_value
                     .as_deref()
                     .and_then(|old| HotKey::from_str(old).ok())
-                    && manager.register(old).is_ok()
                 {
-                    self.registered_hotkey_ids.insert(old.id);
+                    match manager.register(old) {
+                        Ok(()) => {
+                            self.registered_hotkey_ids.insert(old.id);
+                        }
+                        Err(restore_error) => {
+                            self.hotkey_retry_needed =
+                                hotkey_registration_is_retryable(&restore_error);
+                        }
+                    }
                 }
                 self.state.status = format!("Could not register shortcut: {error}");
             }
@@ -685,12 +702,15 @@ impl VeilKeyApp {
     }
 
     fn retry_hotkeys_if_needed(&mut self) {
-        if !self.hotkey_retry_needed || self.last_hotkey_retry.elapsed() < Duration::from_secs(5) {
+        if !self.hotkey_retry_needed
+            || self.last_hotkey_retry.elapsed() < hotkey_retry_delay(self.hotkey_retry_attempts)
+        {
             return;
         }
         self.last_hotkey_retry = Instant::now();
         if self.hotkeys.is_none() {
             let Ok(manager) = GlobalHotKeyManager::new() else {
+                self.hotkey_retry_attempts = self.hotkey_retry_attempts.saturating_add(1);
                 return;
             };
             self.hotkeys = Some(manager);
@@ -726,7 +746,10 @@ impl VeilKeyApp {
         );
         self.hotkey_retry_needed = retry_needed;
         if failed.is_empty() {
+            self.hotkey_retry_attempts = 0;
             self.state.status = "Shortcuts recovered.".into();
+        } else if retry_needed {
+            self.hotkey_retry_attempts = self.hotkey_retry_attempts.saturating_add(1);
         }
     }
 
@@ -1459,9 +1482,9 @@ mod tests {
     }
 
     #[test]
-    fn hotkey_conflicts_and_invalid_bindings_are_not_retried_as_transient_failures() {
+    fn hotkey_conflicts_are_retried_but_invalid_bindings_are_terminal() {
         let hotkey = HotKey::from_str("ctrl+alt+KeyH").unwrap();
-        assert!(!hotkey_registration_is_retryable(
+        assert!(hotkey_registration_is_retryable(
             &global_hotkey::Error::AlreadyRegistered(hotkey)
         ));
         assert!(!hotkey_registration_is_retryable(
@@ -1470,6 +1493,16 @@ mod tests {
         assert!(hotkey_registration_is_retryable(
             &global_hotkey::Error::OsError(std::io::Error::from(std::io::ErrorKind::Other))
         ));
+    }
+
+    #[test]
+    fn shortcut_retry_backoff_grows_to_a_five_minute_cap() {
+        assert_eq!(hotkey_retry_delay(0), Duration::from_secs(5));
+        assert_eq!(hotkey_retry_delay(1), Duration::from_secs(10));
+        assert_eq!(hotkey_retry_delay(2), Duration::from_secs(20));
+        assert_eq!(hotkey_retry_delay(5), Duration::from_secs(160));
+        assert_eq!(hotkey_retry_delay(6), Duration::from_secs(300));
+        assert_eq!(hotkey_retry_delay(20), Duration::from_secs(300));
     }
 
     #[test]

@@ -135,8 +135,7 @@ impl NativeWindowController {
                 } => (window_id.as_str(), *handle),
             };
             let Some(window) = current.iter().find(|window| {
-                (window.id == window_id || window.id.starts_with(&format!("{window_id}|hwnd:")))
-                    && window.native_handle == handle
+                same_window_id(&window.id, window_id) && window.native_handle == handle
             }) else {
                 errors.push(format!(
                     "Window '{window_id}' disappeared; refresh and rebind it."
@@ -234,6 +233,18 @@ impl NativeWindowController {
             ))
         }
     }
+}
+
+fn same_window_id(current: &str, saved: &str) -> bool {
+    if current == saved {
+        return true;
+    }
+    if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
+        return current
+            .rsplit_once("|hwnd:")
+            .is_some_and(|(_, current_handle)| current_handle == saved_handle);
+    }
+    current.starts_with(&format!("{saved}|hwnd:"))
 }
 
 fn process_name(pid: u32) -> String {

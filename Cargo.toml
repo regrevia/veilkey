@@ -1,6 +1,6 @@
 [package]
 name = "veilkey"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2024"
 license = "MIT"
 description = "Group desktop windows and toggle them together with a shortcut."
@@ -18,5 +18,6 @@ windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gd
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-sys = "0.2"
 core-foundation-sys = "0.8"
+
 
 

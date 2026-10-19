@@ -1,3 +1,8 @@
+## 0.2.3 - 2026-10-19
+
+- Match moved Windows windows by stable HWND identity even when their sort order changes.
+- Include the macOS process ID in window bindings to avoid same-name collisions.
+
 ## 0.2.2 - 2026-10-19
 
 - Keep Windows bindings stable when windows move and retry failed global shortcuts.
@@ -22,4 +27,5 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 

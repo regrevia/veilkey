@@ -50,7 +50,13 @@ impl NativeWindowController {
             .map(|w| {
                 let key = (w.app.to_lowercase(), w.title.clone());
                 let ordinal = counts.entry(key).or_default();
-                let id = format!("{}\0{}\0{}", w.app.to_lowercase(), w.title, *ordinal);
+                let id = format!(
+                    "{}\0{}\0{}\0pid:{}",
+                    w.app.to_lowercase(),
+                    w.title,
+                    *ordinal,
+                    w.pid
+                );
                 *ordinal += 1;
                 WindowInfo {
                     native_handle: stable_handle(w.pid, &id),
@@ -92,7 +98,10 @@ impl NativeWindowController {
                     ordinal += 1;
                 }
             }
-            stable_handle(w.pid, &format!("{}\0{}\0{}", key.0, key.1, ordinal)) == handle
+            stable_handle(
+                w.pid,
+                &format!("{}\0{}\0{}\0pid:{}", key.0, key.1, ordinal, w.pid),
+            ) == handle
         });
         let result = match matched {
             Some(window) => apply_to_window(window.element, action),

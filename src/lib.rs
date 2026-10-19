@@ -94,14 +94,7 @@ impl AppState {
         let Some(group) = self.groups.get_mut(index) else {
             return Vec::new();
         };
-        let find_window = |id: &str| {
-            windows.iter().find(|window| {
-                window.id == id
-                    // Windows 0.2.0/0.2.1 used the legacy app/title/ordinal ID.
-                    // Accept it as a prefix while new bindings use the stable HWND suffix.
-                    || window.id.starts_with(&format!("{id}|hwnd:"))
-            })
-        };
+        let find_window = |id: &str| windows.iter().find(|window| same_window_id(&window.id, id));
         let mut actions = Vec::new();
         if !group.window_ids.iter().any(|id| find_window(id).is_some()) {
             return actions;
@@ -158,6 +151,21 @@ impl AppState {
         };
         self.toggle_group(index, windows)
     }
+}
+
+fn same_window_id(current: &str, saved: &str) -> bool {
+    if current == saved {
+        return true;
+    }
+    // Windows bindings carry a stable HWND suffix. The app/title/ordinal prefix
+    // may change when a same-titled window moves and is re-sorted.
+    if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
+        return current
+            .rsplit_once("|hwnd:")
+            .is_some_and(|(_, current_handle)| current_handle == saved_handle);
+    }
+    // Keep 0.2.0/0.2.1 IDs readable while users migrate their groups.
+    current.starts_with(&format!("{saved}\0")) || current.starts_with(&format!("{saved}|hwnd:"))
 }
 
 pub fn state_path() -> PathBuf {
@@ -408,5 +416,24 @@ mod tests {
             WindowAction::SetVisible { visible: false, .. }
         ));
         assert!(!state.groups[0].is_visible);
+    }
+
+    #[test]
+    fn group_toggle_matches_windows_by_stable_suffix_after_resort() {
+        let mut state = AppState::default();
+        state
+            .selected_windows
+            .insert(format!("mumu\0Player\0{}|hwnd:2a", 0));
+        assert!(state.create_group("MuMu set".into()));
+        let moved = [WindowInfo {
+            id: format!("mumu\0Player\0{}|hwnd:2a", 1),
+            ..sample_window("ignored", 0x2a, 500)
+        }];
+        let actions = state.toggle_group(0, &moved);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            WindowAction::SetVisible { visible: false, .. }
+        ));
     }
 }

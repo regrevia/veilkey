@@ -4,7 +4,7 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::str::FromStr;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
 use veilkey::{AppState, WindowAction, WindowInfo, load_state, save_state, state_path};
 
@@ -16,6 +16,8 @@ struct VeilKeyApp {
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
     filter: String,
+    hotkey_retry_needed: bool,
+    last_hotkey_retry: Instant,
 }
 
 impl VeilKeyApp {
@@ -46,8 +48,11 @@ impl VeilKeyApp {
             hotkeys,
             state_file,
             filter: String::new(),
+            hotkey_retry_needed: false,
+            last_hotkey_retry: Instant::now(),
         };
         app.register_saved_hotkeys();
+        let _ = app.refresh_tx.send(());
         app
     }
 
@@ -60,6 +65,7 @@ impl VeilKeyApp {
 
     fn register_saved_hotkeys(&mut self) {
         let Some(manager) = &self.hotkeys else {
+            self.hotkey_retry_needed = true;
             self.state.status = "Global shortcuts are unavailable on this system.".into();
             return;
         };
@@ -74,6 +80,7 @@ impl VeilKeyApp {
             }
         }
         if !failed.is_empty() {
+            self.hotkey_retry_needed = true;
             self.state.status = format!(
                 "Some shortcuts could not be registered: {}",
                 failed.join(", ")
@@ -130,6 +137,7 @@ impl VeilKeyApp {
                 self.persist();
             }
             Err(error) => {
+                self.hotkey_retry_needed = true;
                 if let Some(old) = old_value
                     .as_deref()
                     .and_then(|old| HotKey::from_str(old).ok())
@@ -144,6 +152,34 @@ impl VeilKeyApp {
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
         if let Err(error) = NativeWindowController::apply_actions(actions) {
             self.state.status = error;
+        }
+        // Native window managers may reject or asynchronously apply an operation.
+        // A fresh snapshot keeps the next toggle based on observed OS state.
+        let _ = self.refresh_tx.send(());
+    }
+
+    fn retry_hotkeys_if_needed(&mut self) {
+        if !self.hotkey_retry_needed || self.last_hotkey_retry.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_hotkey_retry = Instant::now();
+        let Ok(manager) = GlobalHotKeyManager::new() else {
+            return;
+        };
+        let mut failed = Vec::new();
+        for group in &self.state.groups {
+            if let Some(value) = group.hotkey.as_deref() {
+                match HotKey::from_str(value) {
+                    Ok(hotkey) if manager.register(hotkey).is_ok() => {}
+                    Ok(_) => failed.push(group.name.clone()),
+                    Err(_) => failed.push(group.name.clone()),
+                }
+            }
+        }
+        self.hotkeys = Some(manager);
+        self.hotkey_retry_needed = !failed.is_empty();
+        if failed.is_empty() {
+            self.state.status = "Shortcuts recovered.".into();
         }
     }
 
@@ -202,6 +238,7 @@ impl VeilKeyApp {
 impl eframe::App for VeilKeyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_window_snapshot();
+        self.retry_hotkeys_if_needed();
         self.handle_hotkey_events();
         ctx.request_repaint_after(Duration::from_millis(100));
 

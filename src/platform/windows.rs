@@ -76,7 +76,16 @@ impl NativeWindowController {
             .map(|w| {
                 let key = (w.app.to_lowercase(), w.title.clone());
                 let ordinal = counts.entry(key).or_default();
-                let id = format!("{}\0{}\0{}", w.app.to_lowercase(), w.title, *ordinal);
+                // Keep the legacy prefix so groups created by older VeilKey builds
+                // remain readable, then add the HWND.  The old ordinal changed when
+                // a window moved; HWND stays stable for the lifetime of that window.
+                let id = format!(
+                    "{}\0{}\0{}|hwnd:{:x}",
+                    w.app.to_lowercase(),
+                    w.title,
+                    *ordinal,
+                    w.hwnd.0 as usize
+                );
                 *ordinal += 1;
                 let visible = unsafe { IsWindowVisible(w.hwnd).as_bool() };
                 WindowInfo {
@@ -125,10 +134,10 @@ impl NativeWindowController {
                     window_id, handle, ..
                 } => (window_id.as_str(), *handle),
             };
-            let Some(window) = current
-                .iter()
-                .find(|window| window.id == window_id && window.native_handle == handle)
-            else {
+            let Some(window) = current.iter().find(|window| {
+                (window.id == window_id || window.id.starts_with(&format!("{window_id}|hwnd:")))
+                    && window.native_handle == handle
+            }) else {
                 errors.push(format!(
                     "Window '{window_id}' disappeared; refresh and rebind it."
                 ));

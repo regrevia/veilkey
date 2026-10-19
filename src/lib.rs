@@ -94,25 +94,27 @@ impl AppState {
         let Some(group) = self.groups.get_mut(index) else {
             return Vec::new();
         };
-        let current: BTreeMap<&str, &WindowInfo> =
-            windows.iter().map(|w| (w.id.as_str(), w)).collect();
+        let find_window = |id: &str| {
+            windows.iter().find(|window| {
+                window.id == id
+                    // Windows 0.2.0/0.2.1 used the legacy app/title/ordinal ID.
+                    // Accept it as a prefix while new bindings use the stable HWND suffix.
+                    || window.id.starts_with(&format!("{id}|hwnd:"))
+            })
+        };
         let mut actions = Vec::new();
-        if !group
-            .window_ids
-            .iter()
-            .any(|id| current.contains_key(id.as_str()))
-        {
+        if !group.window_ids.iter().any(|id| find_window(id).is_some()) {
             return actions;
         }
         let any_visible = group
             .window_ids
             .iter()
-            .filter_map(|id| current.get(id.as_str()))
+            .filter_map(|id| find_window(id))
             .any(|window| window.visible);
         if any_visible {
             group.restore_rects.clear();
             for id in &group.window_ids {
-                if let Some(window) = current.get(id.as_str()).filter(|w| w.visible) {
+                if let Some(window) = find_window(id).filter(|w| w.visible) {
                     group.restore_rects.insert(id.clone(), window.rect);
                     actions.push(WindowAction::SetVisible {
                         window_id: id.clone(),
@@ -125,7 +127,7 @@ impl AppState {
             group.is_visible = false;
         } else {
             for id in &group.window_ids {
-                if let Some(window) = current.get(id.as_str()) {
+                if let Some(window) = find_window(id) {
                     if let Some(rect) = group.restore_rects.get(id) {
                         actions.push(WindowAction::SetRect {
                             window_id: id.clone(),

@@ -11,7 +11,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test --all-targets
+      - run: cargo clippy --all-targets -- -D warnings
+
   windows:
+    needs: verify
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,6 +54,7 @@ jobs:
             packaging/windows/VeilKey-Setup-${{ steps.version.outputs.version }}-windows-x64.exe
 
   macos:
+    needs: verify
     strategy:
       fail-fast: false
       matrix:

@@ -1,3 +1,8 @@
+## 0.2.16 - 2026-10-19
+
+- Run unit tests on Windows and macOS for every CI check.
+- Gate tagged Windows and macOS release packaging on passing tests and Clippy checks on both operating systems.
+
 ## 0.2.15 - 2026-10-19
 
 - Bound and coalesce window refresh requests so slow Accessibility enumeration cannot accumulate an unbounded queue of redundant desktop scans.

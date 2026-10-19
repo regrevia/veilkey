@@ -6,6 +6,19 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+function Invoke-InstallerProcess {
+    param(
+        [Parameter(Mandatory)]
+        [string]$Path,
+        [Parameter(Mandatory)]
+        [string[]]$ArgumentList
+    )
+
+    $process = Start-Process -FilePath $Path -ArgumentList $ArgumentList -Wait -PassThru
+    return $process.ExitCode
+}
+
 $installerItem = Get-Item -LiteralPath $InstallerPath -ErrorAction Stop
 if ($installerItem.PSIsContainer) {
     throw "Installer path '$InstallerPath' is not a file."
@@ -19,9 +32,14 @@ $temporaryRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
 $installDirectory = Join-Path $temporaryRoot "VeilKey-installer-smoke-$([guid]::NewGuid().ToString('N'))"
 
 Write-Output "Installing VeilKey into '$installDirectory'."
-& $InstallerPath '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART' "/DIR=$installDirectory"
-if ($LASTEXITCODE -ne 0) {
-    $message = "VeilKey installer failed with exit code $LASTEXITCODE."
+$installerExitCode = Invoke-InstallerProcess -Path $InstallerPath -ArgumentList @(
+    '/VERYSILENT'
+    '/SUPPRESSMSGBOXES'
+    '/NORESTART'
+    "/DIR=$installDirectory"
+)
+if ($installerExitCode -ne 0) {
+    $message = "VeilKey installer failed with exit code $installerExitCode."
     Write-Host "::error::$message"
     throw $message
 }
@@ -46,9 +64,13 @@ if (-not (Test-Path -LiteralPath $uninstaller -PathType Leaf)) {
 }
 
 Write-Output 'Running the generated uninstaller.'
-& $uninstaller '/VERYSILENT' '/SUPPRESSMSGBOXES' '/NORESTART'
-if ($LASTEXITCODE -ne 0) {
-    $message = "VeilKey uninstaller failed with exit code $LASTEXITCODE."
+$uninstallerExitCode = Invoke-InstallerProcess -Path $uninstaller -ArgumentList @(
+    '/VERYSILENT'
+    '/SUPPRESSMSGBOXES'
+    '/NORESTART'
+)
+if ($uninstallerExitCode -ne 0) {
+    $message = "VeilKey uninstaller failed with exit code $uninstallerExitCode."
     Write-Host "::error::$message"
     throw $message
 }

@@ -220,6 +220,10 @@ fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(Stri
         .collect()
 }
 
+fn hotkey_registration_is_retryable(error: &global_hotkey::Error) -> bool {
+    matches!(error, global_hotkey::Error::OsError(_))
+}
+
 fn group_index_by_name(groups: &[Group], name: &str) -> Option<usize> {
     groups.iter().position(|group| group.name == name)
 }
@@ -507,19 +511,25 @@ impl VeilKeyApp {
             return;
         };
         let mut failed = Vec::new();
+        let mut retry_needed = false;
         for group in &self.state.groups {
             if let Some(value) = group.hotkey.as_deref() {
                 match HotKey::from_str(value) {
-                    Ok(hotkey) if manager.register(hotkey).is_ok() => {
-                        self.registered_hotkey_ids.insert(hotkey.id);
-                    }
-                    Ok(_) => failed.push(format!("{} ({value})", group.name)),
+                    Ok(hotkey) => match manager.register(hotkey) {
+                        Ok(()) => {
+                            self.registered_hotkey_ids.insert(hotkey.id);
+                        }
+                        Err(error) => {
+                            retry_needed |= hotkey_registration_is_retryable(&error);
+                            failed.push(format!("{} ({value})", group.name));
+                        }
+                    },
                     Err(_) => failed.push(format!("{} (invalid shortcut)", group.name)),
                 }
             }
         }
         if !failed.is_empty() {
-            self.hotkey_retry_needed = true;
+            self.hotkey_retry_needed = retry_needed;
             self.state.status = format!(
                 "Some shortcuts could not be registered: {}",
                 failed.join(", ")
@@ -578,7 +588,7 @@ impl VeilKeyApp {
                 self.persist();
             }
             Err(error) => {
-                self.hotkey_retry_needed = true;
+                self.hotkey_retry_needed = hotkey_registration_is_retryable(&error);
                 if let Some(old) = old_value
                     .as_deref()
                     .and_then(|old| HotKey::from_str(old).ok())
@@ -653,11 +663,16 @@ impl VeilKeyApp {
             return;
         };
         let mut failed = Vec::new();
+        let mut retry_needed = false;
         for (name, hotkey) in pending_hotkeys(&self.state.groups, &self.registered_hotkey_ids) {
-            if manager.register(hotkey).is_ok() {
-                self.registered_hotkey_ids.insert(hotkey.id);
-            } else {
-                failed.push(name);
+            match manager.register(hotkey) {
+                Ok(()) => {
+                    self.registered_hotkey_ids.insert(hotkey.id);
+                }
+                Err(error) => {
+                    retry_needed |= hotkey_registration_is_retryable(&error);
+                    failed.push(format!("{name} ({error})"));
+                }
             }
         }
         failed.extend(
@@ -672,7 +687,7 @@ impl VeilKeyApp {
                 })
                 .map(|group| group.name.clone()),
         );
-        self.hotkey_retry_needed = !failed.is_empty();
+        self.hotkey_retry_needed = retry_needed;
         if failed.is_empty() {
             self.state.status = "Shortcuts recovered.".into();
         }
@@ -1401,6 +1416,20 @@ mod tests {
         let pending = pending_hotkeys(&groups, &HashSet::from([active.id]));
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].0, "Needs retry");
+    }
+
+    #[test]
+    fn hotkey_conflicts_and_invalid_bindings_are_not_retried_as_transient_failures() {
+        let hotkey = HotKey::from_str("ctrl+alt+KeyH").unwrap();
+        assert!(!hotkey_registration_is_retryable(
+            &global_hotkey::Error::AlreadyRegistered(hotkey)
+        ));
+        assert!(!hotkey_registration_is_retryable(
+            &global_hotkey::Error::FailedToRegister("unsupported key".into())
+        ));
+        assert!(hotkey_registration_is_retryable(
+            &global_hotkey::Error::OsError(std::io::Error::from(std::io::ErrorKind::Other))
+        ));
     }
 
     #[test]

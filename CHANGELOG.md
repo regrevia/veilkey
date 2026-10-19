@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Retry only transient Windows/global shortcut registration errors; report shortcut conflicts and invalid registrations without polling them indefinitely.
 - Recover the Windows window-operation worker from a per-operation panic, restore snapshot generation state, and report the failure instead of leaving shortcuts permanently busy.
 - Keep periodic window discovery alive after an enumeration panic and surface a retryable status instead of silently freezing the window list.
 - Return a completed binding error when focused-window discovery panics, so shortcut recording cannot remain stuck in a loading state.

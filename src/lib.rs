@@ -173,6 +173,16 @@ fn same_window_id(current: &str, saved: &str) -> bool {
     if current == saved {
         return true;
     }
+    // macOS Accessibility element hashes remain stable when same-titled windows
+    // move and their legacy display-order ordinal changes.
+    if let Some((saved_prefix, saved_ax)) = saved.rsplit_once("|ax:")
+        && let Some((current_prefix, current_ax)) = current.rsplit_once("|ax:")
+        && saved_ax == current_ax
+    {
+        let saved_pid = saved_prefix.rsplit_once("pid:").map(|(_, pid)| pid);
+        let current_pid = current_prefix.rsplit_once("pid:").map(|(_, pid)| pid);
+        return saved_pid.is_some() && saved_pid == current_pid;
+    }
     // Windows bindings carry a stable HWND suffix. The app/title/ordinal prefix
     // may change when a same-titled window moves and is re-sorted.
     if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
@@ -197,7 +207,9 @@ fn same_window_id(current: &str, saved: &str) -> bool {
         };
     }
     // Keep 0.2.0/0.2.1 IDs readable while users migrate their groups.
-    current.starts_with(&format!("{saved}\0")) || current.starts_with(&format!("{saved}|hwnd:"))
+    current.starts_with(&format!("{saved}\0"))
+        || current.starts_with(&format!("{saved}|hwnd:"))
+        || current.starts_with(&format!("{saved}|ax:"))
 }
 
 pub fn state_path() -> PathBuf {
@@ -503,6 +515,18 @@ mod tests {
             ..sample_window("ignored", 0x2a, 500)
         }];
         assert!(state.toggle_group(0, &reused_handle).is_empty());
+    }
+
+    #[test]
+    fn macos_accessibility_identity_survives_window_resorting_but_not_pid_reuse() {
+        let saved = format!("app\0Same title\0{}\0pid:100|ax:abc", 2);
+        let moved = format!("app\0Same title\0{}\0pid:100|ax:abc", 0);
+        let other_process = format!("app\0Same title\0{}\0pid:200|ax:abc", 0);
+        assert!(same_window_id(&moved, &saved));
+        assert!(!same_window_id(&other_process, &saved));
+        let legacy = format!("app\0Same title\0{}\0pid:100", 2);
+        let compatible = format!("{legacy}|ax:abc");
+        assert!(same_window_id(&compatible, &legacy));
     }
 
     #[test]

@@ -2,6 +2,7 @@ use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -27,6 +28,9 @@ fn localized_status(english: bool, status: &str) -> String {
         "Window state recovered after a brief retry." => "窗口状态已自动恢复。".into(),
         "Shortcuts recovered." => "快捷键已恢复。".into(),
         "Keyboard listener recovered." => "全局按键监听已恢复。".into(),
+        "Window operation is already in progress." => "窗口操作正在执行，请稍候。".into(),
+        "Window operation worker stopped." => "窗口操作服务已停止，请重启应用。".into(),
+        "Too many window shortcuts are queued." => "窗口快捷键请求过多，部分请求已忽略。".into(),
         "Press the shortcut now." => "请按下要绑定的快捷键。".into(),
         "That shortcut is already assigned to another group." => {
             "这个快捷键已分配给其他窗口组。".into()
@@ -62,6 +66,18 @@ fn capture_retry_delay(failures: u32) -> Duration {
 
 fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
     let _ = sender.try_send(());
+}
+
+fn enqueue_toggle<T: PartialEq>(queue: &mut VecDeque<T>, value: T, capacity: usize) -> bool {
+    if queue.back() == Some(&value) {
+        queue.pop_back();
+        true
+    } else if queue.len() < capacity {
+        queue.push_back(value);
+        true
+    } else {
+        false
+    }
 }
 
 fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(String, HotKey)> {
@@ -179,7 +195,13 @@ struct VeilKeyApp {
     capture_listener_was_alive: bool,
     capture_rx: Receiver<Result<String, String>>,
     pending_bind_group: Option<usize>,
+    action_tx: mpsc::SyncSender<Vec<WindowAction>>,
+    action_rx: Receiver<ActionCompletion>,
+    action_in_flight: bool,
+    queued_toggles: VecDeque<String>,
 }
+
+type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
 
 impl VeilKeyApp {
     fn new() -> Self {
@@ -197,6 +219,24 @@ impl VeilKeyApp {
             {
                 while refresh_rx.try_recv().is_ok() {}
                 if window_tx.send(NativeWindowController::enumerate()).is_err() {
+                    break;
+                }
+            }
+        });
+        let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
+        let (action_results, action_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok(actions) = action_requests.recv() {
+                let retry = actions.clone();
+                let applied = match NativeWindowController::apply_actions(actions) {
+                    Ok(()) => Ok(()),
+                    Err(first) => match NativeWindowController::apply_actions(retry) {
+                        Ok(()) => Ok(()),
+                        Err(second) => Err(format!("{first}; retry failed: {second}")),
+                    },
+                };
+                let snapshot = NativeWindowController::enumerate();
+                if action_results.send((applied, snapshot)).is_err() {
                     break;
                 }
             }
@@ -287,6 +327,10 @@ impl VeilKeyApp {
             capture_listener_was_alive: false,
             capture_rx,
             pending_bind_group: None,
+            action_tx,
+            action_rx,
+            action_in_flight: false,
+            queued_toggles: VecDeque::new(),
         };
         app.register_saved_hotkeys();
         request_window_refresh(&app.refresh_tx);
@@ -392,20 +436,47 @@ impl VeilKeyApp {
     }
 
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
-        let retry = actions.clone();
-        if let Err(first_error) = NativeWindowController::apply_actions(actions) {
-            // Window handles can briefly be stale while an app creates or restores a
-            // child window. The operations are idempotent, so one immediate retry is
-            // safe and avoids making a transient native error visible to the user.
-            if let Err(second_error) = NativeWindowController::apply_actions(retry) {
-                self.state.status = format!("{first_error}; retry failed: {second_error}");
-            } else {
-                self.state.status = "Window state recovered after a brief retry.".into();
+        if actions.is_empty() {
+            return;
+        }
+        match self.action_tx.try_send(actions) {
+            Ok(()) => self.action_in_flight = true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state.status = "Window operation is already in progress.".into();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state.status = "Window operation worker stopped.".into();
             }
         }
-        // Native window managers may reject or asynchronously apply an operation.
-        // A fresh snapshot keeps the next toggle based on observed OS state.
-        request_window_refresh(&self.refresh_tx);
+    }
+
+    fn update_window_actions(&mut self) {
+        while let Ok((applied, snapshot)) = self.action_rx.try_recv() {
+            self.action_in_flight = false;
+            match applied {
+                Ok(()) => {}
+                Err(error) => self.state.status = error,
+            }
+            match snapshot {
+                Ok(windows) => self.windows = windows,
+                Err(error) => {
+                    self.queued_toggles.clear();
+                    if self.state.status.is_empty() {
+                        self.state.status = error;
+                    }
+                }
+            }
+        }
+        if !self.action_in_flight
+            && let Some(group_name) = self.queued_toggles.pop_front()
+            && let Some(index) = self
+                .state
+                .groups
+                .iter()
+                .position(|group| group.name == group_name)
+        {
+            self.toggle_group_now(index);
+        }
     }
 
     fn retry_hotkeys_if_needed(&mut self) {
@@ -588,6 +659,22 @@ impl VeilKeyApp {
     }
 
     fn toggle_group(&mut self, index: usize) {
+        if self.action_in_flight {
+            // Preserve the order of groups that may overlap; only adjacent repeated
+            // toggles cancel while a native operation is pending.
+            let Some(group_name) = self.state.groups.get(index).map(|group| group.name.clone())
+            else {
+                return;
+            };
+            if !enqueue_toggle(&mut self.queued_toggles, group_name, 16) {
+                self.state.status = "Too many window shortcuts are queued.".into();
+            }
+            return;
+        }
+        self.toggle_group_now(index);
+    }
+
+    fn toggle_group_now(&mut self, index: usize) {
         let actions = self.state.toggle_group(index, &self.windows);
         if actions.is_empty() {
             self.state.status =
@@ -656,6 +743,7 @@ impl VeilKeyApp {
 impl eframe::App for VeilKeyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_window_snapshot();
+        self.update_window_actions();
         self.update_capture_listener_status();
         self.retry_hotkeys_if_needed();
         self.process_global_binding_capture(self.state.english_ui);
@@ -1057,5 +1145,17 @@ mod tests {
         request_window_refresh(&sender);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn adjacent_duplicate_toggles_cancel_without_reordering_overlapping_groups() {
+        let mut queue = VecDeque::new();
+        assert!(enqueue_toggle(&mut queue, "A", 3));
+        assert!(enqueue_toggle(&mut queue, "B", 3));
+        assert!(enqueue_toggle(&mut queue, "A", 3));
+        assert_eq!(queue, VecDeque::from(["A", "B", "A"]));
+        assert!(!enqueue_toggle(&mut queue, "C", 3));
+        assert!(enqueue_toggle(&mut queue, "A", 3));
+        assert_eq!(queue, VecDeque::from(["A", "B"]));
     }
 }

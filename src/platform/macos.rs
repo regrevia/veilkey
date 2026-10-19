@@ -7,7 +7,9 @@ use accessibility_sys::{
     kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
 };
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
-use core_foundation_sys::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, kCFAllocatorDefault};
+use core_foundation_sys::base::{
+    CFEqual, CFHash, CFRelease, CFRetain, CFTypeRef, kCFAllocatorDefault,
+};
 use core_foundation_sys::number::{
     CFBooleanGetTypeID, CFBooleanGetValue, CFBooleanRef, kCFBooleanFalse, kCFBooleanTrue,
 };
@@ -57,17 +59,20 @@ impl NativeWindowController {
         let Some(focused) = focused else {
             return Ok(None);
         };
-        let raw = collect_windows()?;
+        let raw = match collect_windows() {
+            Ok(raw) => raw,
+            Err(error) => {
+                unsafe { CFRelease(focused) };
+                return Err(error);
+            }
+        };
         let mut counts = BTreeMap::<(String, String), usize>::new();
         let mut found = None;
         for window in &raw {
             let key = (window.app.to_lowercase(), window.title.clone());
             let ordinal = counts.entry(key.clone()).or_default();
             if unsafe { CFEqual(focused, window.element as CFTypeRef) } != 0 {
-                found = Some(format!(
-                    "{}\0{}\0{}\0pid:{}",
-                    key.0, key.1, *ordinal, window.pid
-                ));
+                found = Some(window_identity(window, *ordinal));
             }
             *ordinal += 1;
         }
@@ -88,16 +93,10 @@ impl NativeWindowController {
             .map(|w| {
                 let key = (w.app.to_lowercase(), w.title.clone());
                 let ordinal = counts.entry(key).or_default();
-                let id = format!(
-                    "{}\0{}\0{}\0pid:{}",
-                    w.app.to_lowercase(),
-                    w.title,
-                    *ordinal,
-                    w.pid
-                );
+                let id = window_identity(w, *ordinal);
                 *ordinal += 1;
                 WindowInfo {
-                    native_handle: stable_handle(w.pid, &id),
+                    native_handle: window_handle(w),
                     id,
                     title: w.title.clone(),
                     app: w.app.clone(),
@@ -123,16 +122,9 @@ impl NativeWindowController {
             return Ok(());
         }
         let raw = collect_windows()?;
-        let mut counts = BTreeMap::<(String, String), usize>::new();
         let indexed: Vec<_> = raw
             .iter()
-            .map(|window| {
-                let key = (window.app.to_lowercase(), window.title.clone());
-                let ordinal = counts.entry(key.clone()).or_default();
-                let id = format!("{}\0{}\0{}\0pid:{}", key.0, key.1, *ordinal, window.pid);
-                *ordinal += 1;
-                (stable_handle(window.pid, &id), window.element)
-            })
+            .map(|window| (window_handle(window), window.element))
             .collect();
         let mut errors = Vec::new();
         for action in actions {
@@ -215,6 +207,9 @@ fn collect_windows() -> Result<Vec<RawWindow>, String> {
             if element.is_null() {
                 continue;
             }
+            unsafe {
+                AXUIElementSetMessagingTimeout(element, 0.25);
+            }
             let Some(title) = copy_string_attribute(element, kAXTitleAttribute) else {
                 continue;
             };
@@ -280,6 +275,22 @@ fn collect_windows() -> Result<Vec<RawWindow>, String> {
             .cmp(&(&b.app, &b.title, b.rect.x, b.rect.y, b.pid))
     });
     Ok(raw)
+}
+
+fn window_identity(window: &RawWindow, ordinal: usize) -> String {
+    let accessibility_id = unsafe { CFHash(window.element as CFTypeRef) };
+    format!(
+        "{}\0{}\0{}\0pid:{}|ax:{accessibility_id:x}",
+        window.app.to_lowercase(),
+        window.title,
+        ordinal,
+        window.pid
+    )
+}
+
+fn window_handle(window: &RawWindow) -> isize {
+    let accessibility_id = unsafe { CFHash(window.element as CFTypeRef) };
+    stable_handle(window.pid, &format!("ax:{accessibility_id:x}"))
 }
 
 fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), String> {

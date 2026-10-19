@@ -1,3 +1,9 @@
+## 0.2.17 - 2026-10-19
+
+- Run native window group operations off the UI thread and serialize rapid shortcut toggles against fresh window snapshots.
+- Keep macOS window bindings stable when same-titled windows move by matching Accessibility element identity and process ID.
+- Apply Accessibility messaging timeouts to individual macOS windows to limit stalls from unresponsive applications.
+
 ## 0.2.16 - 2026-10-19
 
 - Run unit tests on Windows and macOS for every CI check.

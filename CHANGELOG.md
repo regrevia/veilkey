@@ -1,3 +1,8 @@
+## 0.2.2 - 2026-10-19
+
+- Keep Windows bindings stable when windows move and retry failed global shortcuts.
+- Refresh native window state after group operations.
+
 # Changelog
 
 ## 0.2.1 - 2026-10-19
@@ -17,3 +22,4 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+

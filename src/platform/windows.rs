@@ -7,10 +7,11 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, IsWindowVisible, SW_HIDE,
-    SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER,
-    SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+    EnumWindows, GetForegroundWindow, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW,
+    GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow,
+    IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
+    WINDOWPLACEMENT,
 };
 
 #[derive(Clone)]
@@ -54,8 +55,19 @@ impl NativeWindowController {
                 if title.is_empty() {
                     return BOOL(1);
                 }
+                let minimized = IsIconic(hwnd).as_bool();
                 let mut rect = RECT::default();
-                if GetWindowRect(hwnd, &mut rect).is_err() {
+                if minimized {
+                    let mut placement = WINDOWPLACEMENT {
+                        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                        ..Default::default()
+                    };
+                    if GetWindowPlacement(hwnd, &mut placement).is_ok() {
+                        rect = placement.rcNormalPosition;
+                    } else if GetWindowRect(hwnd, &mut rect).is_err() {
+                        return BOOL(1);
+                    }
+                } else if GetWindowRect(hwnd, &mut rect).is_err() {
                     return BOOL(1);
                 }
                 let mut pid = 0u32;
@@ -104,7 +116,10 @@ impl NativeWindowController {
                     w.pid
                 );
                 *ordinal += 1;
-                let visible = unsafe { IsWindowVisible(w.hwnd).as_bool() };
+                // IsWindowVisible remains true for minimized windows; those have
+                // no on-screen surface and must not appear as visible previews.
+                let visible =
+                    unsafe { IsWindowVisible(w.hwnd).as_bool() && !IsIconic(w.hwnd).as_bool() };
                 WindowInfo {
                     id,
                     title: w.title,

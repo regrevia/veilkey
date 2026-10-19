@@ -1,6 +1,7 @@
 ## Unreleased
 
 - Keep processing Windows window groups and restoring the previously focused app when one forced z-order operation fails.
+- Exclude minimized Windows from the visible-window count and read their normal placement bounds for reliable group restoration.
 
 ## 0.2.25 - 2026-10-19
 

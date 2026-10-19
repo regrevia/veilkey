@@ -1,3 +1,7 @@
+## 0.2.23 - 2026-10-19
+
+- Prevent multiple VeilKey instances from competing for global shortcuts or overwriting each other's saved settings; the lock is released automatically when the app exits.
+
 ## 0.2.22 - 2026-10-19
 
 - Preserve restore positions for windows that already hid successfully when another window in the same group needs a retry.

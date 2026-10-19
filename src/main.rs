@@ -3,6 +3,7 @@ use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -11,8 +12,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
 use veilkey::{
-    AppState, BindMode, Group, WindowAction, WindowInfo, load_state, save_state, state_path,
-    window_is_displayable,
+    AppState, BindMode, Group, WindowAction, WindowInfo, acquire_instance_lock, load_state,
+    save_state, state_path, window_is_displayable,
 };
 
 fn tr<'a>(english: bool, en: &'a str, zh: &'a str) -> &'a str {
@@ -196,6 +197,7 @@ struct VeilKeyApp {
     refresh_tx: mpsc::SyncSender<()>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
+    _instance_lock: File,
     filter: String,
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
@@ -224,7 +226,7 @@ type FocusedBindingLookup = (
 );
 
 impl VeilKeyApp {
-    fn new() -> Self {
+    fn new(instance_lock: File) -> Self {
         let state_file = state_path();
         let mut state = load_state(&state_file);
         for group in &mut state.groups {
@@ -334,6 +336,7 @@ impl VeilKeyApp {
             refresh_tx,
             hotkeys,
             state_file,
+            _instance_lock: instance_lock,
             filter: String::new(),
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
@@ -1192,10 +1195,23 @@ fn main() -> eframe::Result {
             .with_min_inner_size([780.0, 520.0]),
         ..Default::default()
     };
+    let state_file = state_path();
+    let lock_path = state_file.with_file_name("instance.lock");
+    let instance_lock = match acquire_instance_lock(&lock_path) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            eprintln!("VeilKey is already running; using the existing instance.");
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("Could not acquire the VeilKey instance lock: {error}");
+            return Ok(());
+        }
+    };
     eframe::run_native(
         "VeilKey",
         options,
-        Box::new(|_cc| Ok(Box::new(VeilKeyApp::new()))),
+        Box::new(move |_cc| Ok(Box::new(VeilKeyApp::new(instance_lock)))),
     )
 }
 

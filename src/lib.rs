@@ -232,6 +232,21 @@ pub fn state_path() -> PathBuf {
     dir.join("state.json")
 }
 
+pub fn acquire_instance_lock(path: &Path) -> io::Result<fs::File> {
+    let parent = path.parent().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "instance lock has no parent")
+    })?;
+    fs::create_dir_all(parent)?;
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(path)?;
+    fs2::FileExt::try_lock_exclusive(&lock_file)?;
+    Ok(lock_file)
+}
+
 pub fn load_state(path: &Path) -> AppState {
     let Ok(bytes) = fs::read(path) else {
         return AppState::default();
@@ -503,6 +518,21 @@ mod tests {
         assert_eq!(fs::read_to_string(&backup).unwrap(), "{not valid json");
         let _ = fs::remove_file(path);
         let _ = fs::remove_file(backup);
+    }
+
+    #[test]
+    fn only_one_process_can_hold_the_application_instance_lock() {
+        let path = std::env::temp_dir().join(format!(
+            "veilkey-instance-{}-{:?}.lock",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let first = acquire_instance_lock(&path).unwrap();
+        assert!(acquire_instance_lock(&path).is_err());
+        drop(first);
+        let reacquired = acquire_instance_lock(&path).unwrap();
+        drop(reacquired);
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

@@ -1,3 +1,8 @@
+## 0.2.5 - 2026-10-19
+
+- Simplify the group and shortcut binding interface.
+- Ignore modifier-only key presses while recording shortcuts.
+
 ## 0.2.4 - 2026-10-19
 
 - Add in-app shortcut recording so groups can be bound by pressing a key combination.
@@ -32,6 +37,7 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 
 
 

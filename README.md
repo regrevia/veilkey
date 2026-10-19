@@ -6,7 +6,7 @@ This is an independent clean-room project. The earlier project informed only the
 
 ## Current status
 
-VeilKey is in active early access. The current release includes a group manager, window discovery, per-group global shortcuts, atomic persistent settings, Windows window control, and macOS Accessibility-based window control. Select windows in the list, enter a group name, and create the group. Use **Record** next to a group and press the desired key combination, or enter a shortcut such as `ctrl+alt+KeyH` and choose **Bind**. A shortcut already registered by another application may be unavailable.
+VeilKey is in active early access. The current release includes a group manager, window discovery, per-group global shortcuts, atomic persistent settings, Windows window control, and macOS Accessibility-based window control. Select windows in the list, enter a group name, and create the group. Use **Record** next to a group and press the desired key combination, or enter a shortcut such as `ctrl+alt+KeyH` and choose **Save**. A shortcut already registered by another application may be unavailable.
 
 Download the Windows setup program or portable executable, or the macOS archive, from [GitHub Releases](https://github.com/regrevia/veilkey/releases). Windows setup is per-user and does not require administrator access. macOS builds are not currently signed or notarized; Gatekeeper may require the user to approve the app, and Accessibility permission must be granted before window discovery works. Save the macOS archive, extract `VeilKey.app` to Applications, then enable it in **System Settings → Privacy & Security → Accessibility**.
 
@@ -37,4 +37,5 @@ Tagged releases are built by GitHub Actions. The private CNB repository mirrors 
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
 

@@ -205,6 +205,12 @@ impl VeilKeyApp {
             return;
         };
         let debug_name = format!("{key:?}");
+        if matches!(
+            debug_name.as_str(),
+            "Control" | "Shift" | "Alt" | "Super" | "Command" | "MacCmd"
+        ) {
+            return;
+        }
         let key_name = if debug_name.len() == 1 && debug_name.as_bytes()[0].is_ascii_uppercase() {
             format!("Key{debug_name}")
         } else {
@@ -325,12 +331,12 @@ impl eframe::App for VeilKeyApp {
             }
             ui.columns(2, |columns| {
                 let ui = &mut columns[0];
-                ui.heading("Groups");
-                ui.label("Bind windows once, then toggle a whole group together.");
+                ui.heading("Window groups");
+                ui.label("Create a group, then use one shortcut to show or hide it.");
                 ui.add_space(8.0);
                 if self.state.groups.is_empty() {
                     ui.label(egui::RichText::new("No groups yet").strong());
-                    ui.label("Select windows from the list and create your first group.");
+                    ui.label("Select windows on the right to get started.");
                 }
                 let mut toggle = None;
                 let mut delete = None;
@@ -352,11 +358,7 @@ impl eframe::App for VeilKeyApp {
                                 delete = Some(index);
                             }
                             if ui
-                                .button(if group.is_visible {
-                                    "Hide group"
-                                } else {
-                                    "Show group"
-                                })
+                                .button(if group.is_visible { "Hide" } else { "Show" })
                                 .clicked()
                             {
                                 toggle = Some(index);
@@ -370,32 +372,28 @@ impl eframe::App for VeilKeyApp {
                                 .hint_text("ctrl+alt+KeyH")
                                 .desired_width(150.0),
                         );
-                        if ui.small_button("Bind").clicked() {
+                        if ui.small_button("Save").clicked() {
                             hotkey_save = Some((index, group.hotkey_draft.clone()));
                         }
                         if ui
                             .small_button(if self.recording_group == Some(index) {
-                                "Press a key…"
+                                "Press keys…"
                             } else {
                                 "Record"
                             })
                             .clicked()
                         {
                             self.recording_group = Some(index);
-                            self.state.status =
-                                "Press a key combination to bind this group.".into();
+                            self.state.status = "Press the shortcut now.".into();
                         }
                     });
                     let force_popup = ui.add_enabled(
                         cfg!(target_os = "windows"),
-                        egui::Checkbox::new(
-                            &mut group.force_popup,
-                            "Force popup (keep above, don't focus)",
-                        ),
+                        egui::Checkbox::new(&mut group.force_popup, "Keep above other windows"),
                     );
                     let force_popup_changed = force_popup.changed();
                     force_popup.on_hover_text(
-                        "Windows only. On macOS, window stacking is controlled by the system.",
+                        "Windows only. Keeps the group above normal windows without focusing it.",
                     );
                     if force_popup_changed {
                         group_option_changed = true;
@@ -425,11 +423,11 @@ impl eframe::App for VeilKeyApp {
                 }
 
                 let ui = &mut columns[1];
-                ui.heading("Open windows");
-                ui.label("Choose the windows that should belong to the new group.");
+                ui.heading("Available windows");
+                ui.label("Select the windows for a new group.");
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("Group name");
+                    ui.label("Name");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.state.new_group_name)
                             .hint_text("e.g. MuMu set")
@@ -437,22 +435,21 @@ impl eframe::App for VeilKeyApp {
                     );
                 });
                 ui.add_space(6.0);
-                if ui.button("Create group from selected").clicked() {
+                if ui.button("Create group").clicked() {
                     if self
                         .state
                         .create_group(self.state.new_group_name.trim().to_owned())
                     {
                         self.state.status =
-                            "Group created. Set a shortcut to toggle it from anywhere.".into();
+                            "Group created. Record a shortcut to use it anywhere.".into();
                         self.persist();
                     } else {
-                        self.state.status =
-                            "Enter a group name and select at least one window.".into();
+                        self.state.status = "Add a name and select at least one window.".into();
                     }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Filter");
+                    ui.label("Search");
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text("app or title")

@@ -483,7 +483,7 @@ mod tests {
 
     #[test]
     fn repeated_desktop_enumeration_returns_unique_window_identities() {
-        for _ in 0..50 {
+        for _ in 0..200 {
             let windows = NativeWindowController::enumerate().expect("enumerate desktop windows");
             let mut handles = std::collections::HashSet::new();
             let mut ids = std::collections::HashSet::new();

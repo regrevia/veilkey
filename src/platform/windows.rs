@@ -10,11 +10,11 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetForegroundWindow, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW,
-    GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow,
-    IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPlacement,
-    SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
+    EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement,
+    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
+    HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
+    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 #[derive(Clone)]
@@ -238,7 +238,8 @@ impl NativeWindowController {
                             if IsIconic(hwnd).as_bool() {
                                 let mut placement = window_placement(hwnd)?;
                                 let screen_rect = rect_to_native(rect);
-                                placement.rcNormalPosition = screen_to_workspace_rect(
+                                placement.rcNormalPosition = screen_to_placement_rect(
+                                    hwnd,
                                     screen_rect,
                                     MonitorFromRect(&screen_rect, MONITOR_DEFAULTTONEAREST),
                                 );
@@ -320,10 +321,28 @@ fn window_placement(hwnd: HWND) -> Result<WINDOWPLACEMENT, String> {
 fn minimized_window_rect(hwnd: HWND) -> Option<RECT> {
     let placement = window_placement(hwnd).ok()?;
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
-    Some(workspace_to_screen_rect(
-        placement.rcNormalPosition,
-        monitor,
-    ))
+    Some(if uses_workspace_coordinates(hwnd) {
+        workspace_to_screen_rect(placement.rcNormalPosition, monitor)
+    } else {
+        placement.rcNormalPosition
+    })
+}
+
+fn uses_workspace_coordinates(hwnd: HWND) -> bool {
+    let extended_style = unsafe { GetWindowLongPtrW(hwnd, GWL_EXSTYLE) } as u32;
+    extended_style & WS_EX_TOOLWINDOW.0 == 0
+}
+
+fn screen_to_placement_rect(
+    hwnd: HWND,
+    rect: RECT,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+) -> RECT {
+    if uses_workspace_coordinates(hwnd) {
+        screen_to_workspace_rect(rect, monitor)
+    } else {
+        rect
+    }
 }
 
 fn monitor_work_area_offset(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> (i32, i32) {
@@ -343,27 +362,21 @@ fn monitor_work_area_offset(monitor: windows::Win32::Graphics::Gdi::HMONITOR) ->
     )
 }
 
-fn workspace_to_screen_rect(
-    mut rect: RECT,
-    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
-) -> RECT {
+fn workspace_to_screen_rect(rect: RECT, monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
     let (offset_x, offset_y) = monitor_work_area_offset(monitor);
+    translate_rect(rect, offset_x, offset_y)
+}
+
+fn screen_to_workspace_rect(rect: RECT, monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> RECT {
+    let (offset_x, offset_y) = monitor_work_area_offset(monitor);
+    translate_rect(rect, -offset_x, -offset_y)
+}
+
+fn translate_rect(mut rect: RECT, offset_x: i32, offset_y: i32) -> RECT {
     rect.left += offset_x;
     rect.right += offset_x;
     rect.top += offset_y;
     rect.bottom += offset_y;
-    rect
-}
-
-fn screen_to_workspace_rect(
-    mut rect: RECT,
-    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
-) -> RECT {
-    let (offset_x, offset_y) = monitor_work_area_offset(monitor);
-    rect.left -= offset_x;
-    rect.right -= offset_x;
-    rect.top -= offset_y;
-    rect.bottom -= offset_y;
     rect
 }
 
@@ -432,4 +445,24 @@ fn process_name(pid: u32) -> String {
         .unwrap_or_default()
         .to_string_lossy()
         .into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workspace_screen_conversion_round_trips_negative_monitor_coordinates() {
+        // A secondary monitor left and above the primary display, with taskbars
+        // consuming space from the left and top edges of its work area.
+        let screen_rect = RECT {
+            left: -1800,
+            top: -850,
+            right: -900,
+            bottom: -250,
+        };
+        let workspace_rect = translate_rect(screen_rect, -48, -40);
+        let restored_screen_rect = translate_rect(workspace_rect, 48, 40);
+        assert_eq!(restored_screen_rect, screen_rect);
+    }
 }

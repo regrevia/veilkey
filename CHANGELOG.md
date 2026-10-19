@@ -3,6 +3,7 @@
 - Keep processing Windows window groups and restoring the previously focused app when one forced z-order operation fails.
 - Exclude minimized Windows from the visible-window count and read their normal placement bounds for reliable group restoration.
 - Convert minimized-window workspace coordinates to screen coordinates so restoration remains aligned with the correct monitor work area.
+- Preserve screen-coordinate behavior for tool windows and cover negative multi-monitor coordinates in regression tests.
 
 ## 0.2.25 - 2026-10-19
 

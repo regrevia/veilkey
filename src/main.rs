@@ -15,6 +15,36 @@ fn tr<'a>(english: bool, en: &'a str, zh: &'a str) -> &'a str {
     if english { en } else { zh }
 }
 
+fn localized_status(english: bool, status: &str) -> String {
+    if english {
+        return status.to_owned();
+    }
+    match status {
+        "Shortcut registered." => "快捷键已绑定。".into(),
+        "Window state recovered after a brief retry." => "窗口状态已自动恢复。".into(),
+        "Shortcuts recovered." => "快捷键已恢复。".into(),
+        "Press the shortcut now." => "请按下要绑定的快捷键。".into(),
+        "That shortcut is already assigned to another group." => {
+            "这个快捷键已分配给其他窗口组。".into()
+        }
+        "This shortcut is already assigned to the group." => "该快捷键已经绑定到此组。".into(),
+        "Global shortcuts are unavailable on this system." => "当前系统无法启用全局快捷键。".into(),
+        _ if status.starts_with("Could not register shortcut:") => {
+            format!(
+                "快捷键注册失败：{}",
+                status.trim_start_matches("Could not register shortcut:")
+            )
+        }
+        _ if status.starts_with("Some group window actions failed:") => {
+            format!(
+                "部分窗口操作失败：{}",
+                status.trim_start_matches("Some group window actions failed:")
+            )
+        }
+        _ => status.to_owned(),
+    }
+}
+
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
@@ -384,7 +414,7 @@ impl eframe::App for VeilKeyApp {
             if !self.state.status.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(
-                        egui::RichText::new(&self.state.status)
+                        egui::RichText::new(localized_status(english, &self.state.status))
                             .color(egui::Color32::from_rgb(235, 182, 95)),
                     );
                     if ui.small_button("×").clicked() {
@@ -422,8 +452,9 @@ impl eframe::App for VeilKeyApp {
                         ui.vertical(|ui| {
                             ui.label(egui::RichText::new(&group.name).strong());
                             ui.label(format!(
-                                "{} windows · {}",
+                                "{} {} · {}",
                                 group.window_ids.len(),
+                                tr(english, "windows", "个窗口"),
                                 if english {
                                     if group.is_visible { "shown" } else { "hidden" }
                                 } else if group.is_visible {
@@ -453,7 +484,11 @@ impl eframe::App for VeilKeyApp {
                         ui.label(tr(english, "Shortcut", "快捷键"));
                         ui.add(
                             egui::TextEdit::singleline(&mut group.hotkey_draft)
-                                .hint_text("ctrl+alt+KeyH")
+                                .hint_text(tr(
+                                    english,
+                                    "e.g. Ctrl + Alt + H",
+                                    "例如 Ctrl + Alt + H",
+                                ))
                                 .desired_width(150.0),
                         );
                         if ui.small_button(tr(english, "Save", "保存")).clicked() {
@@ -525,7 +560,7 @@ impl eframe::App for VeilKeyApp {
                     ui.label(tr(english, "Name", "组名"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.state.new_group_name)
-                            .hint_text("e.g. MuMu set")
+                            .hint_text(tr(english, "e.g. MuMu set", "例如：MuMu 多开"))
                             .desired_width(190.0),
                     );
                 });
@@ -560,7 +595,7 @@ impl eframe::App for VeilKeyApp {
                     ui.label(tr(english, "Search", "搜索"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
-                            .hint_text("app or title")
+                            .hint_text(tr(english, "App or window name", "应用或窗口名称"))
                             .desired_width(180.0),
                     );
                 });
@@ -596,7 +631,9 @@ impl eframe::App for VeilKeyApp {
                                     ));
                                 });
                                 if self.state.bind_mode == BindMode::OneWindowAtATime
-                                    && ui.small_button(tr(english, "Bind", "绑定")).clicked()
+                                    && ui
+                                        .small_button(tr(english, "Bind this window", "绑定此窗口"))
+                                        .clicked()
                                 {
                                     quick_bind = Some((window.id.clone(), window.title.clone()));
                                 }

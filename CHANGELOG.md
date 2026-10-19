@@ -1,3 +1,8 @@
+## 0.2.8 - 2026-10-19
+
+- Complete Chinese/English UI text and localized status messages.
+- Clarify individual window binding and settings labels.
+
 ## 0.2.7 - 2026-10-19
 
 - Default the interface to Chinese and add a persistent English switch.
@@ -48,6 +53,7 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 
 
 

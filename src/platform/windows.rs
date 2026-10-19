@@ -3,6 +3,9 @@ use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, RECT};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
+};
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
@@ -10,8 +13,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GetForegroundWindow, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW,
     GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOPMOST, IsIconic, IsWindow,
     IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPos, ShowWindowAsync,
-    WINDOWPLACEMENT,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPlacement,
+    SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
 };
 
 #[derive(Clone)]
@@ -58,12 +61,8 @@ impl NativeWindowController {
                 let minimized = IsIconic(hwnd).as_bool();
                 let mut rect = RECT::default();
                 if minimized {
-                    let mut placement = WINDOWPLACEMENT {
-                        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
-                        ..Default::default()
-                    };
-                    if GetWindowPlacement(hwnd, &mut placement).is_ok() {
-                        rect = placement.rcNormalPosition;
+                    if let Some(normal_rect) = minimized_window_rect(hwnd) {
+                        rect = normal_rect;
                     } else if GetWindowRect(hwnd, &mut rect).is_err() {
                         return BOOL(1);
                     }
@@ -236,16 +235,26 @@ impl NativeWindowController {
                         Ok(())
                     } else {
                         unsafe {
-                            SetWindowPos(
-                                hwnd,
-                                None,
-                                rect.x,
-                                rect.y,
-                                rect.width,
-                                rect.height,
-                                SWP_NOZORDER | SWP_NOACTIVATE,
-                            )
-                            .map_err(|e| e.to_string())
+                            if IsIconic(hwnd).as_bool() {
+                                let mut placement = window_placement(hwnd)?;
+                                let screen_rect = rect_to_native(rect);
+                                placement.rcNormalPosition = screen_to_workspace_rect(
+                                    screen_rect,
+                                    MonitorFromRect(&screen_rect, MONITOR_DEFAULTTONEAREST),
+                                );
+                                SetWindowPlacement(hwnd, &placement).map_err(|e| e.to_string())
+                            } else {
+                                SetWindowPos(
+                                    hwnd,
+                                    None,
+                                    rect.x,
+                                    rect.y,
+                                    rect.width,
+                                    rect.height,
+                                    SWP_NOZORDER | SWP_NOACTIVATE,
+                                )
+                                .map_err(|e| e.to_string())
+                            }
                         }
                     }
                 }
@@ -296,6 +305,75 @@ fn wait_for_visibility(hwnd: HWND, visible: bool) -> Result<(), String> {
     } else {
         "Timed out waiting for the window to hide.".into()
     })
+}
+
+fn window_placement(hwnd: HWND) -> Result<WINDOWPLACEMENT, String> {
+    let mut placement = WINDOWPLACEMENT {
+        length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+        ..Default::default()
+    };
+    unsafe { GetWindowPlacement(hwnd, &mut placement) }
+        .map_err(|error| format!("Could not read the window's normal placement: {error}"))?;
+    Ok(placement)
+}
+
+fn minimized_window_rect(hwnd: HWND) -> Option<RECT> {
+    let placement = window_placement(hwnd).ok()?;
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    Some(workspace_to_screen_rect(
+        placement.rcNormalPosition,
+        monitor,
+    ))
+}
+
+fn monitor_work_area_offset(monitor: windows::Win32::Graphics::Gdi::HMONITOR) -> (i32, i32) {
+    if monitor.0.is_null() {
+        return (0, 0);
+    }
+    let mut info = MONITORINFO {
+        cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+        ..Default::default()
+    };
+    if !unsafe { GetMonitorInfoW(monitor, &mut info) }.as_bool() {
+        return (0, 0);
+    }
+    (
+        info.rcWork.left - info.rcMonitor.left,
+        info.rcWork.top - info.rcMonitor.top,
+    )
+}
+
+fn workspace_to_screen_rect(
+    mut rect: RECT,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+) -> RECT {
+    let (offset_x, offset_y) = monitor_work_area_offset(monitor);
+    rect.left += offset_x;
+    rect.right += offset_x;
+    rect.top += offset_y;
+    rect.bottom += offset_y;
+    rect
+}
+
+fn screen_to_workspace_rect(
+    mut rect: RECT,
+    monitor: windows::Win32::Graphics::Gdi::HMONITOR,
+) -> RECT {
+    let (offset_x, offset_y) = monitor_work_area_offset(monitor);
+    rect.left -= offset_x;
+    rect.right -= offset_x;
+    rect.top -= offset_y;
+    rect.bottom -= offset_y;
+    rect
+}
+
+fn rect_to_native(rect: Rect) -> RECT {
+    RECT {
+        left: rect.x,
+        top: rect.y,
+        right: rect.x + rect.width,
+        bottom: rect.y + rect.height,
+    }
 }
 
 fn same_window_id(current: &str, saved: &str) -> bool {

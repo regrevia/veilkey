@@ -1,3 +1,7 @@
+## 0.2.22 - 2026-10-19
+
+- Preserve restore positions for windows that already hid successfully when another window in the same group needs a retry.
+
 ## 0.2.21 - 2026-10-19
 
 - Wait for Windows visibility changes to reach the native window state before refreshing snapshots and processing queued shortcuts; report bounded timeouts for unresponsive windows.

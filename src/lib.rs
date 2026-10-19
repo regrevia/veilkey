@@ -121,7 +121,6 @@ impl AppState {
             .filter_map(|id| find_window(id))
             .any(|window| window.visible);
         if any_visible {
-            group.restore_rects.clear();
             for id in &group.window_ids {
                 if let Some(window) = find_window(id).filter(|w| w.visible) {
                     group.restore_rects.insert(id.clone(), window.rect);
@@ -401,6 +400,50 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn partial_hide_retry_preserves_geometry_of_windows_already_hidden() {
+        let mut state = AppState::default();
+        state.selected_windows.extend(["a".into(), "b".into()]);
+        assert!(state.create_group("MuMu set".into()));
+
+        let initially_visible = [sample_window("a", 1, 10), sample_window("b", 2, 900)];
+        state.toggle_group(0, &initially_visible);
+
+        // Window a hid successfully; b stayed visible and was moved before retry.
+        let partially_hidden = [
+            WindowInfo {
+                visible: false,
+                ..sample_window("a", 1, 400)
+            },
+            sample_window("b", 2, 1200),
+        ];
+        state.toggle_group(0, &partially_hidden);
+
+        let all_hidden = [
+            WindowInfo {
+                visible: false,
+                ..sample_window("a", 1, 400)
+            },
+            WindowInfo {
+                visible: false,
+                ..sample_window("b", 2, 1200)
+            },
+        ];
+        let restore_actions = state.toggle_group(0, &all_hidden);
+        let restored_rects: BTreeMap<_, _> = restore_actions
+            .into_iter()
+            .filter_map(|action| match action {
+                WindowAction::SetRect {
+                    window_id, rect, ..
+                } => Some((window_id, rect)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(restored_rects.get("a").map(|rect| rect.x), Some(10));
+        assert_eq!(restored_rects.get("b").map(|rect| rect.x), Some(1200));
     }
 
     #[test]

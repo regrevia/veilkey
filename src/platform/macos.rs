@@ -54,6 +54,9 @@ impl NativeWindowController {
         if system.is_null() {
             return Ok(None);
         }
+        unsafe {
+            AXUIElementSetMessagingTimeout(system, 0.25);
+        }
         let focused = copy_value(system, kAXFocusedWindowAttribute);
         unsafe { CFRelease(system as CFTypeRef) };
         let Some(focused) = focused else {

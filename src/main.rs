@@ -202,6 +202,9 @@ struct VeilKeyApp {
     capture_listener_alive: Arc<AtomicBool>,
     capture_listener_was_alive: bool,
     capture_rx: Receiver<Result<String, String>>,
+    focused_binding_rx: Receiver<FocusedBindingLookup>,
+    focused_binding_tx: mpsc::Sender<FocusedBindingLookup>,
+    focused_binding_in_flight: bool,
     pending_bind_group: Option<usize>,
     action_tx: mpsc::SyncSender<Vec<WindowAction>>,
     action_rx: Receiver<ActionCompletion>,
@@ -210,6 +213,11 @@ struct VeilKeyApp {
 }
 
 type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
+type FocusedBindingLookup = (
+    String,
+    Result<Option<String>, String>,
+    Result<Vec<WindowInfo>, String>,
+);
 
 impl VeilKeyApp {
     fn new() -> Self {
@@ -254,6 +262,7 @@ impl VeilKeyApp {
         let capture_listener_alive = Arc::new(AtomicBool::new(false));
         let listener_alive = Arc::clone(&capture_listener_alive);
         let (capture_tx, capture_rx) = mpsc::channel();
+        let (focused_binding_tx, focused_binding_rx) = mpsc::channel();
         thread::spawn(move || {
             let mut failures = 0_u32;
             loop {
@@ -331,6 +340,9 @@ impl VeilKeyApp {
             capture_listener_alive,
             capture_listener_was_alive: false,
             capture_rx,
+            focused_binding_rx,
+            focused_binding_tx,
+            focused_binding_in_flight: false,
             pending_bind_group: None,
             action_tx,
             action_rx,
@@ -542,58 +554,116 @@ impl VeilKeyApp {
             }
             Ok(chord) => {
                 self.capture_armed.store(false, Ordering::Release);
-                let index = if let Some(index) = self.pending_bind_group.take() {
-                    Some(index)
-                } else {
-                    match NativeWindowController::foreground_window_id() {
-                        Ok(Some(window_id)) => {
-                            let fresh = NativeWindowController::enumerate().unwrap_or_default();
-                            if let Some(window) = fresh.iter().find(|window| window.id == window_id)
-                            {
-                                let mut name = window.title.clone();
-                                let mut suffix = 2;
-                                while self
-                                    .state
-                                    .groups
-                                    .iter()
-                                    .any(|group| group.name.eq_ignore_ascii_case(&name))
-                                {
-                                    name = format!("{} {suffix}", window.title);
-                                    suffix += 1;
-                                }
-                                self.state.selected_windows.insert(window.id.clone());
-                                if self.state.create_group(name) {
-                                    self.windows = fresh;
-                                    Some(self.state.groups.len() - 1)
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            self.state.status = error;
-                            None
-                        }
-                    }
-                };
-                if let Some(index) = index {
+                if let Some(index) = self.pending_bind_group.take() {
                     self.register_group_hotkey(index, chord);
-                } else if self.state.status.is_empty() {
+                } else {
                     self.state.status = tr(
                         english,
-                        "No eligible foreground window found.",
-                        "没有找到可绑定的前台窗口。",
+                        "Checking the focused window…",
+                        "正在识别当前前台窗口…",
                     )
                     .into();
+                    self.focused_binding_in_flight = true;
+                    let sender = self.focused_binding_tx.clone();
+                    thread::spawn(move || {
+                        let focused = NativeWindowController::foreground_window_id();
+                        let windows = if matches!(focused, Ok(Some(_))) {
+                            NativeWindowController::enumerate()
+                        } else {
+                            Ok(Vec::new())
+                        };
+                        let _ = sender.send((chord, focused, windows));
+                    });
                 }
             }
         }
     }
 
+    fn complete_focused_window_bindings(&mut self, english: bool) {
+        while let Ok((chord, focused, windows)) = self.focused_binding_rx.try_recv() {
+            self.focused_binding_in_flight = false;
+            self.complete_focused_window_binding(chord, focused, windows, english);
+        }
+    }
+
+    fn complete_focused_window_binding(
+        &mut self,
+        chord: String,
+        focused: Result<Option<String>, String>,
+        windows: Result<Vec<WindowInfo>, String>,
+        english: bool,
+    ) {
+        let window_id = match focused {
+            Ok(Some(window_id)) => window_id,
+            Ok(None) => {
+                self.state.status = tr(
+                    english,
+                    "No eligible foreground window found.",
+                    "没有找到可绑定的前台窗口。",
+                )
+                .into();
+                return;
+            }
+            Err(error) => {
+                self.state.status = error;
+                return;
+            }
+        };
+        let fresh = match windows {
+            Ok(windows) => windows,
+            Err(error) => {
+                self.state.status = error;
+                return;
+            }
+        };
+        let Some(window) = fresh
+            .iter()
+            .find(|window| window.id == window_id && window_is_displayable(window))
+        else {
+            self.state.status = tr(
+                english,
+                "No eligible foreground window found.",
+                "没有找到可绑定的前台窗口。",
+            )
+            .into();
+            return;
+        };
+        let mut name = window.title.clone();
+        let mut suffix = 2;
+        while self
+            .state
+            .groups
+            .iter()
+            .any(|group| group.name.eq_ignore_ascii_case(&name))
+        {
+            name = format!("{} {suffix}", window.title);
+            suffix += 1;
+        }
+        self.state.selected_windows.insert(window.id.clone());
+        if self.state.create_group(name) {
+            self.windows = fresh;
+            let index = self.state.groups.len() - 1;
+            self.register_group_hotkey(index, chord);
+        } else {
+            self.state.status = tr(
+                english,
+                "Could not create a group for the focused window.",
+                "无法为当前前台窗口创建分组。",
+            )
+            .into();
+        }
+    }
+
     fn arm_focused_window_binding(&mut self, english: bool) {
+        if self.focused_binding_in_flight {
+            self.state.status = tr(
+                english,
+                "The previous focused-window lookup is still running.",
+                "上一次前台窗口识别仍在进行，请稍候。",
+            )
+            .into();
+            return;
+        }
         self.pending_bind_group = None;
         self.capture_armed.store(true, Ordering::Release);
         self.state.status = if self.capture_listener_alive.load(Ordering::Acquire) {
@@ -755,6 +825,7 @@ impl eframe::App for VeilKeyApp {
         self.update_capture_listener_status();
         self.retry_hotkeys_if_needed();
         self.process_global_binding_capture(self.state.english_ui);
+        self.complete_focused_window_bindings(self.state.english_ui);
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
         ctx.request_repaint_after(Duration::from_millis(100));

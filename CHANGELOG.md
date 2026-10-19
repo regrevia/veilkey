@@ -1,3 +1,8 @@
+## 0.2.19 - 2026-10-19
+
+- Move focused-window discovery after shortcut capture to a background task so slow macOS Accessibility queries do not freeze the interface.
+- Bound concurrent focused-window lookups and apply a timeout to the macOS system-wide focused-window query.
+
 ## 0.2.18 - 2026-10-19
 
 - Report every global key listener failure instead of suppressing all failures after the first incident.

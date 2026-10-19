@@ -6,7 +6,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
-$InstallerPath = (Resolve-Path -LiteralPath $InstallerPath -PathType Leaf).Path
+$installerItem = Get-Item -LiteralPath $InstallerPath -ErrorAction Stop
+if ($installerItem.PSIsContainer) {
+    throw "Installer path '$InstallerPath' is not a file."
+}
+$InstallerPath = $installerItem.FullName
 $temporaryRoot = if ([string]::IsNullOrWhiteSpace($env:RUNNER_TEMP)) {
     [System.IO.Path]::GetTempPath()
 } else {

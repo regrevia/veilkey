@@ -115,52 +115,47 @@ impl NativeWindowController {
     }
 
     pub fn apply(action: WindowAction) -> Result<(), String> {
-        let (_window_id, handle) = match &action {
-            WindowAction::SetVisible {
-                window_id, handle, ..
-            }
-            | WindowAction::SetRect {
-                window_id, handle, ..
-            } => (window_id.clone(), *handle),
-        };
-        let raw = collect_windows()?;
-        let matched = raw.iter().find(|w| {
-            let key = (w.app.to_lowercase(), w.title.clone());
-            let mut ordinal = 0;
-            for candidate in &raw {
-                let candidate_key = (candidate.app.to_lowercase(), candidate.title.clone());
-                if candidate_key == key {
-                    if candidate.pid == w.pid && candidate.element == w.element {
-                        break;
-                    }
-                    ordinal += 1;
-                }
-            }
-            stable_handle(
-                w.pid,
-                &format!("{}\0{}\0{}\0pid:{}", key.0, key.1, ordinal, w.pid),
-            ) == handle
-        });
-        let result = match matched {
-            Some(window) => apply_to_window(window.element, action),
-            None => Err(
-                "The selected macOS window no longer exists. Refresh the list and rebind it."
-                    .into(),
-            ),
-        };
-        for window in raw {
-            unsafe {
-                CFRelease(window.element as CFTypeRef);
-            }
-        }
-        result
+        Self::apply_actions(vec![action])
     }
 
     pub fn apply_actions(actions: Vec<WindowAction>) -> Result<(), String> {
+        if actions.is_empty() {
+            return Ok(());
+        }
+        let raw = collect_windows()?;
+        let mut counts = BTreeMap::<(String, String), usize>::new();
+        let indexed: Vec<_> = raw
+            .iter()
+            .map(|window| {
+                let key = (window.app.to_lowercase(), window.title.clone());
+                let ordinal = counts.entry(key.clone()).or_default();
+                let id = format!("{}\0{}\0{}\0pid:{}", key.0, key.1, *ordinal, window.pid);
+                *ordinal += 1;
+                (stable_handle(window.pid, &id), window.element)
+            })
+            .collect();
         let mut errors = Vec::new();
         for action in actions {
-            if let Err(error) = Self::apply(action) {
-                errors.push(error);
+            let handle = match &action {
+                WindowAction::SetVisible { handle, .. } | WindowAction::SetRect { handle, .. } => {
+                    *handle
+                }
+            };
+            match indexed.iter().find(|(candidate, _)| *candidate == handle) {
+                Some((_, element)) => {
+                    if let Err(error) = apply_to_window(*element, action) {
+                        errors.push(error);
+                    }
+                }
+                None => errors.push(
+                    "The selected macOS window no longer exists. Refresh the list and rebind it."
+                        .into(),
+                ),
+            }
+        }
+        for window in raw {
+            unsafe {
+                CFRelease(window.element as CFTypeRef);
             }
         }
         if errors.is_empty() {

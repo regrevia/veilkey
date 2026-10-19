@@ -1,3 +1,7 @@
+## 0.2.14 - 2026-10-19
+
+- Enumerate macOS Accessibility windows once per group operation, avoiding repeated desktop-wide queries for each window and reducing toggle latency.
+
 ## 0.2.13 - 2026-10-19
 
 - Back off global key capture retries exponentially up to 60 seconds instead of retrying every 2 seconds during prolonged permission or system failures.

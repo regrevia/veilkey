@@ -1,0 +1,49 @@
+name: Windows Preview Packages
+
+on:
+  push:
+    branches: [codex/windows-batch-recovery]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Check and test
+        shell: pwsh
+        run: |
+          cargo fmt --all -- --check
+          cargo test --all-targets
+          cargo clippy --all-targets -- -D warnings
+      - name: Build Windows release executable
+        shell: pwsh
+        run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build installer and portable executable
+        shell: pwsh
+        run: .\packaging\windows\build.ps1 -OutputDirectory 'packaging/output'
+      - name: Smoke test installer and uninstaller
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $portable = Get-Item "packaging/output/VeilKey-$version-windows-x64.exe"
+          $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portable.FullName).Hash
+          $installer = Get-Item "packaging/output/VeilKey-Setup-$version-windows-x64.exe"
+          .\packaging\windows\smoke-test-installer.ps1 -InstallerPath $installer.FullName -ExpectedExecutableSha256 $hash
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VeilKey-Windows-preview
+          path: |
+            packaging/output/VeilKey-Setup-*-windows-x64.exe
+            packaging/output/VeilKey-[0-9]*-windows-x64.exe
+          if-no-files-found: error
+          retention-days: 14

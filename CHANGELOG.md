@@ -1,3 +1,7 @@
+## 0.2.10 - 2026-10-19
+
+- Preserve working global shortcuts while retrying only registrations that failed, preventing recovery attempts from disabling active bindings.
+
 ## 0.2.9 - 2026-10-19
 
 - Bind the focused foreground window directly by pressing a global shortcut combination.

@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
 use veilkey::{
-    AppState, BindMode, WindowAction, WindowInfo, load_state, save_state, state_path,
+    AppState, BindMode, Group, WindowAction, WindowInfo, load_state, save_state, state_path,
     window_is_displayable,
 };
 
@@ -46,6 +46,17 @@ fn localized_status(english: bool, status: &str) -> String {
         }
         _ => status.to_owned(),
     }
+}
+
+fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(String, HotKey)> {
+    groups
+        .iter()
+        .filter_map(|group| {
+            let value = group.hotkey.as_deref()?;
+            let hotkey = HotKey::from_str(value).ok()?;
+            (!registered_ids.contains(&hotkey.id)).then(|| (group.name.clone(), hotkey))
+        })
+        .collect()
 }
 
 fn is_modifier(key: rdev::Key) -> bool {
@@ -144,6 +155,7 @@ struct VeilKeyApp {
     filter: String,
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
+    registered_hotkey_ids: HashSet<u32>,
     recording_group: Option<usize>,
     settings_open: bool,
     capture_armed: Arc<AtomicBool>,
@@ -231,6 +243,7 @@ impl VeilKeyApp {
             filter: String::new(),
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
+            registered_hotkey_ids: HashSet::new(),
             recording_group: None,
             settings_open: false,
             capture_armed,
@@ -259,7 +272,9 @@ impl VeilKeyApp {
         for group in &self.state.groups {
             if let Some(value) = group.hotkey.as_deref() {
                 match HotKey::from_str(value) {
-                    Ok(hotkey) if manager.register(hotkey).is_ok() => {}
+                    Ok(hotkey) if manager.register(hotkey).is_ok() => {
+                        self.registered_hotkey_ids.insert(hotkey.id);
+                    }
                     Ok(_) => failed.push(format!("{} ({value})", group.name)),
                     Err(_) => failed.push(format!("{} (invalid shortcut)", group.name)),
                 }
@@ -310,11 +325,13 @@ impl VeilKeyApp {
         if let Some(old) = old_value
             .as_deref()
             .and_then(|old| HotKey::from_str(old).ok())
+            && manager.unregister(old).is_ok()
         {
-            let _ = manager.unregister(old);
+            self.registered_hotkey_ids.remove(&old.id);
         }
         match manager.register(hotkey) {
             Ok(()) => {
+                self.registered_hotkey_ids.insert(hotkey.id);
                 if let Some(group) = self.state.groups.get_mut(index) {
                     group.hotkey = Some(value);
                     group.hotkey_draft = group.hotkey.clone().unwrap_or_default();
@@ -327,8 +344,9 @@ impl VeilKeyApp {
                 if let Some(old) = old_value
                     .as_deref()
                     .and_then(|old| HotKey::from_str(old).ok())
+                    && manager.register(old).is_ok()
                 {
-                    let _ = manager.register(old);
+                    self.registered_hotkey_ids.insert(old.id);
                 }
                 self.state.status = format!("Could not register shortcut: {error}");
             }
@@ -357,20 +375,36 @@ impl VeilKeyApp {
             return;
         }
         self.last_hotkey_retry = Instant::now();
-        let Ok(manager) = GlobalHotKeyManager::new() else {
+        if self.hotkeys.is_none() {
+            let Ok(manager) = GlobalHotKeyManager::new() else {
+                return;
+            };
+            self.hotkeys = Some(manager);
+            self.registered_hotkey_ids.clear();
+        }
+        let Some(manager) = self.hotkeys.as_ref() else {
             return;
         };
         let mut failed = Vec::new();
-        for group in &self.state.groups {
-            if let Some(value) = group.hotkey.as_deref() {
-                match HotKey::from_str(value) {
-                    Ok(hotkey) if manager.register(hotkey).is_ok() => {}
-                    Ok(_) => failed.push(group.name.clone()),
-                    Err(_) => failed.push(group.name.clone()),
-                }
+        for (name, hotkey) in pending_hotkeys(&self.state.groups, &self.registered_hotkey_ids) {
+            if manager.register(hotkey).is_ok() {
+                self.registered_hotkey_ids.insert(hotkey.id);
+            } else {
+                failed.push(name);
             }
         }
-        self.hotkeys = Some(manager);
+        failed.extend(
+            self.state
+                .groups
+                .iter()
+                .filter(|group| {
+                    group
+                        .hotkey
+                        .as_deref()
+                        .is_some_and(|value| HotKey::from_str(value).is_err())
+                })
+                .map(|group| group.name.clone()),
+        );
         self.hotkey_retry_needed = !failed.is_empty();
         if failed.is_empty() {
             self.state.status = "Shortcuts recovered.".into();
@@ -914,4 +948,33 @@ fn main() -> eframe::Result {
         options,
         Box::new(|_cc| Ok(Box::new(VeilKeyApp::new()))),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn group(name: &str, hotkey: &str) -> Group {
+        Group {
+            name: name.into(),
+            window_ids: Default::default(),
+            hotkey: Some(hotkey.into()),
+            hotkey_draft: String::new(),
+            is_visible: true,
+            force_popup: false,
+            restore_rects: Default::default(),
+        }
+    }
+
+    #[test]
+    fn shortcut_recovery_only_retries_unregistered_bindings() {
+        let active = HotKey::from_str("ctrl+alt+KeyH").unwrap();
+        let groups = [
+            group("Already active", "ctrl+alt+KeyH"),
+            group("Needs retry", "ctrl+alt+KeyJ"),
+        ];
+        let pending = pending_hotkeys(&groups, &HashSet::from([active.id]));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].0, "Needs retry");
+    }
 }

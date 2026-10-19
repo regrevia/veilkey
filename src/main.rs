@@ -6,7 +6,7 @@ use std::collections::VecDeque;
 use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -75,6 +75,10 @@ fn capture_retry_delay_after_failure(failures: &mut u32, listener_uptime: Durati
 
 fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
     let _ = sender.try_send(());
+}
+
+fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
+    snapshot_generation == current_generation && current_generation.is_multiple_of(2)
 }
 
 fn enqueue_toggle<T: PartialEq>(queue: &mut VecDeque<T>, value: T, capacity: usize) -> bool {
@@ -193,7 +197,8 @@ fn hotkey_key_name(key: rdev::Key) -> Option<&'static str> {
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
-    window_rx: Receiver<Result<Vec<WindowInfo>, String>>,
+    window_rx: Receiver<(u64, Result<Vec<WindowInfo>, String>)>,
+    snapshot_generation: Arc<AtomicU64>,
     refresh_tx: mpsc::SyncSender<()>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
@@ -218,7 +223,7 @@ struct VeilKeyApp {
     queued_toggles: VecDeque<String>,
 }
 
-type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
+type ActionCompletion = (u64, Result<(), String>, Result<Vec<WindowInfo>, String>);
 type FocusedBindingLookup = (
     String,
     Result<Option<String>, String>,
@@ -235,20 +240,28 @@ impl VeilKeyApp {
         // A slow Accessibility query must never let stale snapshots accumulate.
         let (window_tx, window_rx) = mpsc::sync_channel(1);
         let (refresh_tx, refresh_rx) = mpsc::sync_channel(1);
+        let snapshot_generation = Arc::new(AtomicU64::new(0));
+        let refresh_generation = Arc::clone(&snapshot_generation);
         thread::spawn(move || {
             while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
                 refresh_rx.recv_timeout(Duration::from_secs(2))
             {
                 while refresh_rx.try_recv().is_ok() {}
-                if window_tx.send(NativeWindowController::enumerate()).is_err() {
+                let generation = refresh_generation.load(Ordering::Acquire);
+                let snapshot = NativeWindowController::enumerate();
+                if window_tx.send((generation, snapshot)).is_err() {
                     break;
                 }
             }
         });
         let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
         let (action_results, action_rx) = mpsc::channel();
+        let action_generation = Arc::clone(&snapshot_generation);
         thread::spawn(move || {
             while let Ok(actions) = action_requests.recv() {
+                // Odd generations mean a native operation is in progress. Any
+                // concurrent enumeration is discarded, even if it returns late.
+                action_generation.fetch_add(1, Ordering::AcqRel);
                 let retry = actions.clone();
                 let applied = match NativeWindowController::apply_actions(actions) {
                     Ok(()) => Ok(()),
@@ -258,7 +271,11 @@ impl VeilKeyApp {
                     },
                 };
                 let snapshot = NativeWindowController::enumerate();
-                if action_results.send((applied, snapshot)).is_err() {
+                let generation = action_generation.fetch_add(1, Ordering::AcqRel) + 1;
+                if action_results
+                    .send((generation, applied, snapshot))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -333,6 +350,7 @@ impl VeilKeyApp {
             state,
             windows: Vec::new(),
             window_rx,
+            snapshot_generation,
             refresh_tx,
             hotkeys,
             state_file,
@@ -475,18 +493,20 @@ impl VeilKeyApp {
     }
 
     fn update_window_actions(&mut self) {
-        while let Ok((applied, snapshot)) = self.action_rx.try_recv() {
+        while let Ok((generation, applied, snapshot)) = self.action_rx.try_recv() {
             self.action_in_flight = false;
             match applied {
                 Ok(()) => {}
                 Err(error) => self.state.status = error,
             }
-            match snapshot {
-                Ok(windows) => self.windows = windows,
-                Err(error) => {
-                    self.queued_toggles.clear();
-                    if self.state.status.is_empty() {
-                        self.state.status = error;
+            if snapshot_is_current(generation, self.snapshot_generation.load(Ordering::Acquire)) {
+                match snapshot {
+                    Ok(windows) => self.windows = windows,
+                    Err(error) => {
+                        self.queued_toggles.clear();
+                        if self.state.status.is_empty() {
+                            self.state.status = error;
+                        }
                     }
                 }
             }
@@ -815,10 +835,12 @@ impl VeilKeyApp {
 
     fn update_window_snapshot(&mut self) {
         let mut latest = None;
-        while let Ok(result) = self.window_rx.try_recv() {
-            latest = Some(result);
+        while let Ok((generation, result)) = self.window_rx.try_recv() {
+            latest = Some((generation, result));
         }
-        if let Some(result) = latest {
+        if let Some((generation, result)) = latest
+            && snapshot_is_current(generation, self.snapshot_generation.load(Ordering::Acquire))
+        {
             match result {
                 Ok(windows) => {
                     self.windows = windows;
@@ -1293,6 +1315,14 @@ mod tests {
         request_window_refresh(&sender);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn snapshots_from_during_or_before_window_operations_are_discarded() {
+        assert!(snapshot_is_current(4, 4));
+        assert!(!snapshot_is_current(3, 3));
+        assert!(!snapshot_is_current(2, 4));
+        assert!(!snapshot_is_current(4, 5));
     }
 
     #[test]

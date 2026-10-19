@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Discard stale window snapshots that race with native window-group operations, keeping shortcut decisions aligned with the latest completed state.
 - Keep processing Windows window groups and restoring the previously focused app when one forced z-order operation fails.
 - Exclude minimized Windows from the visible-window count and read their normal placement bounds for reliable group restoration.
 - Convert minimized-window workspace coordinates to screen coordinates so restoration remains aligned with the correct monitor work area.

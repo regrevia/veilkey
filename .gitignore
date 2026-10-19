@@ -3,3 +3,4 @@
 *.app
 *.dmg
 *.exe
+packaging/output

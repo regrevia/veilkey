@@ -15,3 +15,5 @@ main:
       stages:
         - name: check
           script: cargo check --all-targets
+        - name: release-build
+          script: cargo build --release

@@ -1,35 +1,67 @@
 name: Release
+
 on:
   push:
     tags: ['v*']
+
 permissions:
   contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+      - name: Read version
+        id: version
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - run: cargo build --release --target x86_64-pc-windows-msvc
+      - name: Install Inno Setup
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build installer
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path 'packaging/output' | Out-Null
+          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$((Get-Location).Path)" "/DBinaryPath=$((Get-Location).Path)\target\x86_64-pc-windows-msvc\release\veilkey.exe" 'packaging/windows/veilkey.iss'
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/veilkey.exe' "packaging/output/VeilKey-${{ steps.version.outputs.version }}-windows-x64.exe"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            packaging/output/VeilKey-${{ steps.version.outputs.version }}-windows-x64.exe
+            packaging/windows/VeilKey-Setup-${{ steps.version.outputs.version }}-windows-x64.exe
+
+  macos:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            suffix: windows-x64.exe
           - os: macos-14
             target: aarch64-apple-darwin
-            suffix: macos-arm64
           - os: macos-13
             target: x86_64-apple-darwin
-            suffix: macos-x64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-      - run: cargo build --release --target ${{ matrix.target }}
-      - name: Stage artifact
+      - name: Read version
+        id: version
         shell: bash
-        run: cp "target/${{ matrix.target }}/release/veilkey${{ endsWith(matrix.suffix, '.exe') && '.exe' || '' }}" "veilkey-${{ matrix.suffix }}"
+        run: echo "version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" >> "$GITHUB_OUTPUT"
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Build app bundle
+        run: bash packaging/macos/build-app.sh "${{ matrix.target }}" "${{ steps.version.outputs.version }}" packaging/output
       - uses: softprops/action-gh-release@v2
         with:
-          files: veilkey-${{ matrix.suffix }}
-
+          files: packaging/output/VeilKey-${{ steps.version.outputs.version }}-${{ matrix.target }}.zip

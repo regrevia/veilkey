@@ -1,5 +1,6 @@
 ## Unreleased
 
+- Serialize Windows desktop enumeration, focused-window lookup, and window-group changes through one poison-tolerant native API lock to avoid overlapping window-state reads and mutations.
 - Retry only transient Windows/global shortcut registration errors; report shortcut conflicts and invalid registrations without polling them indefinitely.
 - Recover the Windows window-operation worker from a per-operation panic, restore snapshot generation state, and report the failure instead of leaving shortcuts permanently busy.
 - Keep periodic window discovery alive after an enumeration panic and surface a retryable status instead of silently freezing the window list.

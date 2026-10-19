@@ -7,6 +7,8 @@ use std::fs::File;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::str::FromStr;
 use std::sync::Arc;
+#[cfg(windows)]
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -94,6 +96,31 @@ fn capture_retry_delay_after_failure(failures: &mut u32, listener_uptime: Durati
 
 fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
     let _ = sender.try_send(());
+}
+
+struct NativeWindowLock {
+    #[cfg(windows)]
+    lock: Mutex<()>,
+}
+
+impl NativeWindowLock {
+    fn new() -> Self {
+        Self {
+            #[cfg(windows)]
+            lock: Mutex::new(()),
+        }
+    }
+}
+
+fn with_native_window_lock<T>(lock: &NativeWindowLock, operation: impl FnOnce() -> T) -> T {
+    #[cfg(windows)]
+    let _guard = lock
+        .lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    #[cfg(not(windows))]
+    let _ = lock;
+    operation()
 }
 
 fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
@@ -319,6 +346,7 @@ struct VeilKeyApp {
     windows: Vec<WindowInfo>,
     window_rx: Receiver<(u64, Result<Vec<WindowInfo>, String>)>,
     snapshot_generation: Arc<AtomicU64>,
+    native_window_lock: Arc<NativeWindowLock>,
     refresh_tx: mpsc::SyncSender<()>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
@@ -362,13 +390,17 @@ impl VeilKeyApp {
         let (refresh_tx, refresh_rx) = mpsc::sync_channel(1);
         let snapshot_generation = Arc::new(AtomicU64::new(0));
         let refresh_generation = Arc::clone(&snapshot_generation);
+        let native_window_lock = Arc::new(NativeWindowLock::new());
+        let refresh_window_lock = Arc::clone(&native_window_lock);
         thread::spawn(move || {
             while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
                 refresh_rx.recv_timeout(Duration::from_secs(2))
             {
                 while refresh_rx.try_recv().is_ok() {}
                 let generation = refresh_generation.load(Ordering::Acquire);
-                let snapshot = enumerate_windows_resiliently(NativeWindowController::enumerate);
+                let snapshot = with_native_window_lock(&refresh_window_lock, || {
+                    enumerate_windows_resiliently(NativeWindowController::enumerate)
+                });
                 if window_tx.send((generation, snapshot)).is_err() {
                     break;
                 }
@@ -377,21 +409,25 @@ impl VeilKeyApp {
         let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
         let (action_results, action_rx) = mpsc::channel();
         let action_generation = Arc::clone(&snapshot_generation);
+        let action_window_lock = Arc::clone(&native_window_lock);
         thread::spawn(move || {
             while let Ok(actions) = action_requests.recv() {
                 // Odd generations mean a native operation is in progress. Any
                 // concurrent enumeration is discarded, even if it returns late.
                 let completion = run_protected_window_operation(&action_generation, || {
-                    let retry = actions.clone();
-                    let applied = match NativeWindowController::apply_actions(actions) {
-                        Ok(()) => Ok(()),
-                        Err(first) => match NativeWindowController::apply_actions(retry) {
+                    with_native_window_lock(&action_window_lock, || {
+                        let retry = actions.clone();
+                        let applied = match NativeWindowController::apply_actions(actions) {
                             Ok(()) => Ok(()),
-                            Err(second) => Err(format!("{first}; retry failed: {second}")),
-                        },
-                    };
-                    let snapshot = enumerate_windows_resiliently(NativeWindowController::enumerate);
-                    (applied, snapshot)
+                            Err(first) => match NativeWindowController::apply_actions(retry) {
+                                Ok(()) => Ok(()),
+                                Err(second) => Err(format!("{first}; retry failed: {second}")),
+                            },
+                        };
+                        let snapshot =
+                            enumerate_windows_resiliently(NativeWindowController::enumerate);
+                        (applied, snapshot)
+                    })
                 });
                 if action_results.send(completion).is_err() {
                     break;
@@ -469,6 +505,7 @@ impl VeilKeyApp {
             windows: Vec::new(),
             window_rx,
             snapshot_generation,
+            native_window_lock,
             refresh_tx,
             hotkeys,
             state_file,
@@ -730,15 +767,18 @@ impl VeilKeyApp {
                     .into();
                     self.focused_binding_in_flight = true;
                     let sender = self.focused_binding_tx.clone();
+                    let focused_window_lock = Arc::clone(&self.native_window_lock);
                     thread::spawn(move || {
                         let (focused, windows) = lookup_focused_window_resiliently(|| {
-                            let focused = NativeWindowController::foreground_window_id();
-                            let windows = if matches!(focused, Ok(Some(_))) {
-                                enumerate_windows_resiliently(NativeWindowController::enumerate)
-                            } else {
-                                Ok(Vec::new())
-                            };
-                            (focused, windows)
+                            with_native_window_lock(&focused_window_lock, || {
+                                let focused = NativeWindowController::foreground_window_id();
+                                let windows = if matches!(focused, Ok(Some(_))) {
+                                    enumerate_windows_resiliently(NativeWindowController::enumerate)
+                                } else {
+                                    Ok(Vec::new())
+                                };
+                                (focused, windows)
+                            })
                         });
                         let _ = sender.send((chord, focused, windows));
                     });
@@ -1461,6 +1501,17 @@ mod tests {
         request_window_refresh(&sender);
         assert!(receiver.try_recv().is_ok());
         assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn poisoned_native_window_lock_is_recovered_for_later_calls() {
+        let lock = NativeWindowLock::new();
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            with_native_window_lock(&lock, || panic!("simulated native API fault"));
+        }));
+        assert!(result.is_err());
+        assert_eq!(with_native_window_lock(&lock, || 42), 42);
     }
 
     #[test]

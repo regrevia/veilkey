@@ -13,6 +13,12 @@ main:
         RUSTUP_TOOLCHAIN: stable
         PATH: /Users/apple/.cargo/bin:/Users/apple/.local/opt/node-current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
       stages:
+        - name: format
+          script: cargo fmt --all -- --check
+        - name: test
+          script: cargo test --all-targets
+        - name: lint
+          script: cargo clippy --all-targets -- -D warnings
         - name: check
           script: cargo check --all-targets
         - name: release-build

@@ -36,6 +36,8 @@ pub struct Group {
     #[serde(default)]
     pub force_popup: bool,
     #[serde(default)]
+    pub macos_hide_application: bool,
+    #[serde(default)]
     pub restore_rects: BTreeMap<String, Rect>,
 }
 
@@ -73,6 +75,7 @@ pub enum WindowAction {
         handle: isize,
         visible: bool,
         force_popup: bool,
+        hide_application: bool,
     },
     SetRect {
         window_id: String,
@@ -100,6 +103,7 @@ impl AppState {
             hotkey_draft: String::new(),
             is_visible: true,
             force_popup: false,
+            macos_hide_application: false,
             restore_rects: BTreeMap::new(),
         });
         self.new_group_name.clear();
@@ -129,6 +133,7 @@ impl AppState {
                         handle: window.native_handle,
                         visible: false,
                         force_popup: group.force_popup,
+                        hide_application: group.macos_hide_application,
                     });
                 }
             }
@@ -136,7 +141,9 @@ impl AppState {
         } else {
             for id in &group.window_ids {
                 if let Some(window) = find_window(id) {
-                    if let Some(rect) = group.restore_rects.get(id) {
+                    if !group.macos_hide_application
+                        && let Some(rect) = group.restore_rects.get(id)
+                    {
                         actions.push(WindowAction::SetRect {
                             window_id: id.clone(),
                             handle: window.native_handle,
@@ -148,6 +155,7 @@ impl AppState {
                         handle: window.native_handle,
                         visible: true,
                         force_popup: group.force_popup,
+                        hide_application: group.macos_hide_application,
                     });
                 }
             }
@@ -358,13 +366,15 @@ mod tests {
                     window_id: "a".into(),
                     handle: 1,
                     visible: false,
-                    force_popup: false
+                    force_popup: false,
+                    hide_application: false
                 },
                 WindowAction::SetVisible {
                     window_id: "b".into(),
                     handle: 2,
                     visible: false,
-                    force_popup: false
+                    force_popup: false,
+                    hide_application: false
                 },
             ]
         );
@@ -395,7 +405,8 @@ mod tests {
                     window_id: "a".into(),
                     handle: 1,
                     visible: true,
-                    force_popup: false
+                    force_popup: false,
+                    hide_application: false
                 },
                 WindowAction::SetRect {
                     window_id: "b".into(),
@@ -411,7 +422,8 @@ mod tests {
                     window_id: "b".into(),
                     handle: 2,
                     visible: true,
-                    force_popup: false
+                    force_popup: false,
+                    hide_application: false
                 },
             ]
         );
@@ -462,6 +474,44 @@ mod tests {
     }
 
     #[test]
+    fn macos_hide_application_option_is_carried_by_group_visibility_actions() {
+        let mut state = AppState::default();
+        state.selected_windows.insert("a".into());
+        assert!(state.create_group("App group".into()));
+        state.groups[0].macos_hide_application = true;
+        let windows = [sample_window("a", 1, 10)];
+
+        let hide = state.toggle_group(0, &windows);
+        assert!(matches!(
+            hide.as_slice(),
+            [WindowAction::SetVisible {
+                visible: false,
+                hide_application: true,
+                ..
+            }]
+        ));
+
+        let hidden = [WindowInfo {
+            visible: false,
+            ..sample_window("a", 1, 10)
+        }];
+        let show = state.toggle_group(0, &hidden);
+        assert!(show.iter().any(|action| matches!(
+            action,
+            WindowAction::SetVisible {
+                visible: true,
+                hide_application: true,
+                ..
+            }
+        )));
+        assert!(
+            !show
+                .iter()
+                .any(|action| matches!(action, WindowAction::SetRect { .. }))
+        );
+    }
+
+    #[test]
     fn state_round_trip_preserves_groups_and_ignores_transient_ui_state() {
         let mut state = AppState::default();
         state.selected_windows.insert("a".into());
@@ -477,6 +527,21 @@ mod tests {
         assert!(loaded.selected_windows.is_empty());
         assert!(loaded.new_group_name.is_empty());
         assert!(loaded.status.is_empty());
+    }
+
+    #[test]
+    fn older_saved_groups_default_to_per_window_minimizing() {
+        let mut state = AppState::default();
+        state.selected_windows.insert("a".into());
+        assert!(state.create_group("Legacy group".into()));
+        let mut value = serde_json::to_value(state).unwrap();
+        value["groups"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("macos_hide_application");
+
+        let loaded: AppState = serde_json::from_value(value).unwrap();
+        assert!(!loaded.groups[0].macos_hide_application);
     }
 
     #[test]

@@ -3,8 +3,9 @@ use accessibility_sys::{
     AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
     AXUIElementCreateSystemWide, AXUIElementRef, AXUIElementSetAttributeValue,
     AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue, kAXErrorSuccess,
-    kAXFocusedWindowAttribute, kAXMinimizedAttribute, kAXPositionAttribute, kAXSizeAttribute,
-    kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
+    kAXFocusedWindowAttribute, kAXHiddenAttribute, kAXMinimizedAttribute, kAXPositionAttribute,
+    kAXSizeAttribute, kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
+    kAXWindowsAttribute,
 };
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation_sys::base::{
@@ -127,7 +128,7 @@ impl NativeWindowController {
         let raw = collect_windows()?;
         let indexed: Vec<_> = raw
             .iter()
-            .map(|window| (window_handle(window), window.element))
+            .map(|window| (window_handle(window), window.element, window.pid))
             .collect();
         let mut errors = Vec::new();
         for action in actions {
@@ -136,9 +137,20 @@ impl NativeWindowController {
                     *handle
                 }
             };
-            match indexed.iter().find(|(candidate, _)| *candidate == handle) {
-                Some((_, element)) => {
-                    if let Err(error) = apply_to_window(*element, action) {
+            match indexed
+                .iter()
+                .find(|(candidate, _, _)| *candidate == handle)
+            {
+                Some((_, element, pid)) => {
+                    let result = match action {
+                        WindowAction::SetVisible {
+                            visible,
+                            hide_application: true,
+                            ..
+                        } => apply_to_application(*pid, visible),
+                        action => apply_to_window(*element, action),
+                    };
+                    if let Err(error) = result {
                         errors.push(error);
                     }
                 }
@@ -204,6 +216,8 @@ fn collect_windows() -> Result<Vec<RawWindow>, String> {
             }
             continue;
         };
+        let application_hidden =
+            copy_bool_attribute(application, kAXHiddenAttribute).unwrap_or(false);
         let array = windows as CFArrayRef;
         for index in 0..unsafe { CFArrayGetCount(array) } {
             let element = unsafe { CFArrayGetValueAtIndex(array, index) as AXUIElementRef };
@@ -244,7 +258,8 @@ fn collect_windows() -> Result<Vec<RawWindow>, String> {
                     &mut size as *mut _ as *mut c_void,
                 )
             };
-            let visible = !copy_bool_attribute(element, kAXMinimizedAttribute).unwrap_or(false);
+            let visible = !application_hidden
+                && !copy_bool_attribute(element, kAXMinimizedAttribute).unwrap_or(false);
             unsafe {
                 CFRelease(position_value);
                 CFRelease(size_value);
@@ -298,7 +313,11 @@ fn window_handle(window: &RawWindow) -> isize {
 
 fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), String> {
     match action {
-        WindowAction::SetVisible { visible, .. } => {
+        WindowAction::SetVisible {
+            visible,
+            hide_application: false,
+            ..
+        } => {
             let attribute = cf_string(kAXMinimizedAttribute)?;
             let value = unsafe {
                 if visible {
@@ -313,6 +332,9 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
                 CFRelease(attribute as CFTypeRef);
             }
             ax_result(result)
+        }
+        WindowAction::SetVisible { .. } => {
+            Err("Application hide action requires an app target".into())
         }
         WindowAction::SetRect { rect, .. } => {
             let point = CGPoint {
@@ -364,6 +386,37 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
             ax_result(size_result)
         }
     }
+}
+
+fn apply_to_application(pid: i32, visible: bool) -> Result<(), String> {
+    let application = unsafe { AXUIElementCreateApplication(pid) };
+    if application.is_null() {
+        return Err(format!("Could not access macOS application process {pid}"));
+    }
+    unsafe {
+        AXUIElementSetMessagingTimeout(application, 0.5);
+    }
+    let attribute = match cf_string(kAXHiddenAttribute) {
+        Ok(attribute) => attribute,
+        Err(error) => {
+            unsafe { CFRelease(application as CFTypeRef) };
+            return Err(error);
+        }
+    };
+    let value = unsafe {
+        if visible {
+            kCFBooleanFalse
+        } else {
+            kCFBooleanTrue
+        }
+    };
+    let result =
+        unsafe { AXUIElementSetAttributeValue(application, attribute, value as CFTypeRef) };
+    unsafe {
+        CFRelease(attribute as CFTypeRef);
+        CFRelease(application as CFTypeRef);
+    }
+    ax_result(result)
 }
 fn copy_value(element: AXUIElementRef, name: &str) -> Option<CFTypeRef> {
     let attribute = cf_string(name).ok()?;

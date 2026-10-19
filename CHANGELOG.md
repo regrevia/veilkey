@@ -1,3 +1,7 @@
+## 0.2.24 - 2026-10-19
+
+- Add an optional macOS group mode that hides the owning apps instead of minimizing their windows, avoiding minimized-window tiles in the Dock. The mode explicitly affects every window belonging to each app and leaves its Dock icon visible.
+
 ## 0.2.23 - 2026-10-19
 
 - Prevent multiple VeilKey instances from competing for global shortcuts or overwriting each other's saved settings; the lock is released automatically when the app exits.

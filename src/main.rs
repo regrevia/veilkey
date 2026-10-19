@@ -1040,6 +1040,26 @@ impl eframe::App for VeilKeyApp {
                     if force_popup_changed {
                         group_option_changed = true;
                     }
+                    let hide_application = ui.add_enabled(
+                        cfg!(target_os = "macos") && group.is_visible,
+                        egui::Checkbox::new(
+                            &mut group.macos_hide_application,
+                            tr(
+                                english,
+                                "Hide whole app instead of minimizing",
+                                "隐藏整个应用，不最小化窗口",
+                            ),
+                        ),
+                    );
+                    let hide_application_changed = hide_application.changed();
+                    hide_application.on_hover_text(tr(
+                        english,
+                        "macOS only. Hides every window of each app in this group. The app icon remains in the Dock; this avoids minimized-window tiles. Change this option while the group is shown.",
+                        "仅 macOS。会隐藏组内每个应用的全部窗口，应用图标仍保留在程序坞；可避免出现最小化窗口缩略项。请在窗口组显示时调整。",
+                    ));
+                    if hide_application_changed {
+                        group_option_changed = true;
+                    }
                 }
                 if let Some(index) = delete {
                     if let Some(group) = self.state.groups.get(index)
@@ -1227,6 +1247,7 @@ mod tests {
             hotkey_draft: String::new(),
             is_visible: true,
             force_popup: false,
+            macos_hide_application: false,
             restore_rects: Default::default(),
         }
     }

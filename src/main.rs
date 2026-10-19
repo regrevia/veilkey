@@ -6,7 +6,14 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
-use veilkey::{AppState, WindowAction, WindowInfo, load_state, save_state, state_path};
+use veilkey::{
+    AppState, BindMode, WindowAction, WindowInfo, load_state, save_state, state_path,
+    window_is_displayable,
+};
+
+fn tr<'a>(english: bool, en: &'a str, zh: &'a str) -> &'a str {
+    if english { en } else { zh }
+}
 
 struct VeilKeyApp {
     state: AppState,
@@ -19,6 +26,7 @@ struct VeilKeyApp {
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
     recording_group: Option<usize>,
+    settings_open: bool,
 }
 
 impl VeilKeyApp {
@@ -52,6 +60,7 @@ impl VeilKeyApp {
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
             recording_group: None,
+            settings_open: false,
         };
         app.register_saved_hotkeys();
         let _ = app.refresh_tx.send(());
@@ -305,26 +314,73 @@ impl eframe::App for VeilKeyApp {
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
         ctx.request_repaint_after(Duration::from_millis(100));
+        let english = self.state.english_ui;
+        let displayable_count = self
+            .windows
+            .iter()
+            .filter(|w| window_is_displayable(w))
+            .count();
 
         egui::TopBottomPanel::top("header").show(ctx, |ui| {
             ui.horizontal(|ui| {
                 ui.heading("VeilKey");
                 ui.add_space(8.0);
                 ui.label(
-                    egui::RichText::new("WINDOW GROUPS")
+                    egui::RichText::new(tr(english, "WINDOW GROUPS", "窗口快捷管理"))
                         .small()
                         .color(egui::Color32::from_rgb(120, 165, 185)),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Refresh windows").clicked() {
+                    if ui.button(tr(english, "中文", "English")).clicked() {
+                        self.state.english_ui = !self.state.english_ui;
+                        self.persist();
+                    }
+                    if ui.button(tr(english, "Settings", "设置")).clicked() {
+                        self.settings_open = !self.settings_open;
+                    }
+                    if ui.button(tr(english, "Refresh", "刷新窗口")).clicked() {
                         let _ = self.refresh_tx.send(());
                     }
-                    ui.label(format!("{} windows", self.windows.len()));
+                    ui.label(if english {
+                        format!("{displayable_count} windows")
+                    } else {
+                        format!("{displayable_count} 个窗口")
+                    });
                 });
             });
         });
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            if self.settings_open {
+                ui.horizontal(|ui| {
+                    ui.heading(tr(english, "Settings", "设置"));
+                    ui.label(tr(english, "Binding mode", "绑定方式"));
+                    let list_mode = self.state.bind_mode == BindMode::SelectFromList;
+                    if ui
+                        .selectable_label(list_mode, tr(english, "Select", "列表多选"))
+                        .clicked()
+                    {
+                        self.state.bind_mode = BindMode::SelectFromList;
+                        self.persist();
+                    }
+                    if ui
+                        .selectable_label(
+                            !list_mode,
+                            tr(english, "One window at a time", "逐个绑定"),
+                        )
+                        .clicked()
+                    {
+                        self.state.bind_mode = BindMode::OneWindowAtATime;
+                        self.persist();
+                    }
+                    ui.label(tr(
+                        english,
+                        "Language is saved automatically.",
+                        "语言会自动保存。",
+                    ));
+                });
+                ui.separator();
+            }
             if !self.state.status.is_empty() {
                 ui.horizontal(|ui| {
                     ui.label(
@@ -339,12 +395,22 @@ impl eframe::App for VeilKeyApp {
             }
             ui.columns(2, |columns| {
                 let ui = &mut columns[0];
-                ui.heading("Window groups");
-                ui.label("Create a group, then use one shortcut to show or hide it.");
+                ui.heading(tr(english, "Window groups", "窗口组"));
+                ui.label(tr(
+                    english,
+                    "Create a group, then use one shortcut to show or hide it.",
+                    "把窗口加入组，再用一个快捷键统一显示或隐藏。",
+                ));
                 ui.add_space(8.0);
                 if self.state.groups.is_empty() {
-                    ui.label(egui::RichText::new("No groups yet").strong());
-                    ui.label("Select windows on the right to get started.");
+                    ui.label(
+                        egui::RichText::new(tr(english, "No groups yet", "还没有窗口组")).strong(),
+                    );
+                    ui.label(tr(
+                        english,
+                        "Select windows on the right to get started.",
+                        "先在右侧选择要绑定的窗口。",
+                    ));
                 }
                 let mut toggle = None;
                 let mut delete = None;
@@ -358,15 +424,25 @@ impl eframe::App for VeilKeyApp {
                             ui.label(format!(
                                 "{} windows · {}",
                                 group.window_ids.len(),
-                                if group.is_visible { "shown" } else { "hidden" }
+                                if english {
+                                    if group.is_visible { "shown" } else { "hidden" }
+                                } else if group.is_visible {
+                                    "显示中"
+                                } else {
+                                    "已隐藏"
+                                }
                             ));
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.small_button("Remove").clicked() {
+                            if ui.small_button(tr(english, "Remove", "移除")).clicked() {
                                 delete = Some(index);
                             }
                             if ui
-                                .button(if group.is_visible { "Hide" } else { "Show" })
+                                .button(if group.is_visible {
+                                    tr(english, "Hide", "隐藏")
+                                } else {
+                                    tr(english, "Show", "显示")
+                                })
                                 .clicked()
                             {
                                 toggle = Some(index);
@@ -374,35 +450,42 @@ impl eframe::App for VeilKeyApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        ui.label("Shortcut");
+                        ui.label(tr(english, "Shortcut", "快捷键"));
                         ui.add(
                             egui::TextEdit::singleline(&mut group.hotkey_draft)
                                 .hint_text("ctrl+alt+KeyH")
                                 .desired_width(150.0),
                         );
-                        if ui.small_button("Save").clicked() {
+                        if ui.small_button(tr(english, "Save", "保存")).clicked() {
                             hotkey_save = Some((index, group.hotkey_draft.clone()));
                         }
                         if ui
                             .small_button(if self.recording_group == Some(index) {
-                                "Press keys…"
+                                tr(english, "Press keys…", "请按快捷键…")
                             } else {
-                                "Record"
+                                tr(english, "Record", "录制")
                             })
                             .clicked()
                         {
                             self.recording_group = Some(index);
-                            self.state.status = "Press the shortcut now.".into();
+                            self.state.status =
+                                tr(english, "Press the shortcut now.", "请按下要绑定的快捷键。")
+                                    .into();
                         }
                     });
                     let force_popup = ui.add_enabled(
                         cfg!(target_os = "windows"),
-                        egui::Checkbox::new(&mut group.force_popup, "Keep above other windows"),
+                        egui::Checkbox::new(
+                            &mut group.force_popup,
+                            tr(english, "Keep above other windows", "显示在其他窗口上方"),
+                        ),
                     );
                     let force_popup_changed = force_popup.changed();
-                    force_popup.on_hover_text(
+                    force_popup.on_hover_text(tr(
+                        english,
                         "Windows only. Keeps the group above normal windows without focusing it.",
-                    );
+                        "仅 Windows 可用；窗口置顶但不抢占焦点。",
+                    ));
                     if force_popup_changed {
                         group_option_changed = true;
                     }
@@ -431,11 +514,15 @@ impl eframe::App for VeilKeyApp {
                 }
 
                 let ui = &mut columns[1];
-                ui.heading("Available windows");
-                ui.label("Select the windows for a new group.");
+                ui.heading(tr(english, "Available windows", "可绑定窗口"));
+                ui.label(tr(
+                    english,
+                    "Only visible windows with a usable preview are listed.",
+                    "这里只显示当前可见且有实际尺寸的窗口。",
+                ));
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label("Name");
+                    ui.label(tr(english, "Name", "组名"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.state.new_group_name)
                             .hint_text("e.g. MuMu set")
@@ -443,57 +530,105 @@ impl eframe::App for VeilKeyApp {
                     );
                 });
                 ui.add_space(6.0);
-                if ui.button("Create group").clicked() {
+                if self.state.bind_mode == BindMode::SelectFromList
+                    && ui
+                        .button(tr(english, "Create group", "创建窗口组"))
+                        .clicked()
+                {
                     if self
                         .state
                         .create_group(self.state.new_group_name.trim().to_owned())
                     {
-                        self.state.status =
-                            "Group created. Record a shortcut to use it anywhere.".into();
+                        self.state.status = tr(
+                            english,
+                            "Group created. Record a shortcut to use it anywhere.",
+                            "窗口组已创建，录制快捷键即可随时切换。",
+                        )
+                        .into();
                         self.persist();
                     } else {
-                        self.state.status = "Add a name and select at least one window.".into();
+                        self.state.status = tr(
+                            english,
+                            "Add a name and select at least one window.",
+                            "请填写组名并至少选择一个窗口。",
+                        )
+                        .into();
                     }
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label("Search");
+                    ui.label(tr(english, "Search", "搜索"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text("app or title")
                             .desired_width(180.0),
                     );
                 });
+                let mut quick_bind = None;
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     for window in &self.windows {
+                        if !window_is_displayable(window) {
+                            continue;
+                        }
                         let text = format!("{} {}", window.app, window.title);
                         if !self.filter.is_empty()
                             && !text.to_lowercase().contains(&self.filter.to_lowercase())
                         {
                             continue;
                         }
-                        ui.horizontal(|ui| {
-                            let mut selected = self.state.selected_windows.contains(&window.id);
-                            if ui.checkbox(&mut selected, "").changed() {
-                                if selected {
-                                    self.state.selected_windows.insert(window.id.clone());
-                                } else {
-                                    self.state.selected_windows.remove(&window.id);
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let mut selected = self.state.selected_windows.contains(&window.id);
+                                if self.state.bind_mode == BindMode::SelectFromList
+                                    && ui.checkbox(&mut selected, "").changed()
+                                {
+                                    if selected {
+                                        self.state.selected_windows.insert(window.id.clone());
+                                    } else {
+                                        self.state.selected_windows.remove(&window.id);
+                                    }
                                 }
-                            }
-                            ui.vertical(|ui| {
-                                ui.label(egui::RichText::new(&window.title).strong());
-                                ui.label(format!(
-                                    "{} · {} · {}×{}",
-                                    window.app,
-                                    if window.visible { "visible" } else { "hidden" },
-                                    window.rect.width,
-                                    window.rect.height
-                                ));
+                                ui.vertical(|ui| {
+                                    ui.label(egui::RichText::new(&window.title).strong());
+                                    ui.label(format!(
+                                        "{} · {}×{}",
+                                        window.app, window.rect.width, window.rect.height
+                                    ));
+                                });
+                                if self.state.bind_mode == BindMode::OneWindowAtATime
+                                    && ui.small_button(tr(english, "Bind", "绑定")).clicked()
+                                {
+                                    quick_bind = Some((window.id.clone(), window.title.clone()));
+                                }
                             });
                         });
                     }
                 });
+                if let Some((window_id, title)) = quick_bind {
+                    let mut name = title.clone();
+                    let mut suffix = 2;
+                    while self
+                        .state
+                        .groups
+                        .iter()
+                        .any(|group| group.name.eq_ignore_ascii_case(&name))
+                    {
+                        name = format!("{title} {suffix}");
+                        suffix += 1;
+                    }
+                    self.state.selected_windows.insert(window_id);
+                    if self.state.create_group(name) {
+                        let index = self.state.groups.len() - 1;
+                        self.recording_group = Some(index);
+                        self.state.status = tr(
+                            english,
+                            "Window added. Press its shortcut.",
+                            "窗口已添加，请按下快捷键。",
+                        )
+                        .into();
+                        self.persist();
+                    }
+                }
             });
         });
     }

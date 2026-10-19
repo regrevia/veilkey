@@ -42,12 +42,28 @@ pub struct Group {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
     pub groups: Vec<Group>,
+    #[serde(default)]
+    pub english_ui: bool,
+    #[serde(default)]
+    pub bind_mode: BindMode,
     #[serde(skip)]
     pub selected_windows: BTreeSet<String>,
     #[serde(skip)]
     pub new_group_name: String,
     #[serde(skip)]
     pub status: String,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BindMode {
+    #[default]
+    SelectFromList,
+    OneWindowAtATime,
+}
+
+pub fn window_is_displayable(window: &WindowInfo) -> bool {
+    window.visible && window.rect.width > 1 && window.rect.height > 1
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -457,5 +473,25 @@ mod tests {
             actions[0],
             WindowAction::SetVisible { visible: false, .. }
         ));
+    }
+
+    #[test]
+    fn window_list_excludes_hidden_and_zero_sized_windows() {
+        let visible = sample_window("visible", 1, 0);
+        let hidden = WindowInfo {
+            visible: false,
+            ..sample_window("hidden", 2, 0)
+        };
+        let empty = WindowInfo {
+            rect: Rect {
+                width: 0,
+                height: 0,
+                ..Rect::default()
+            },
+            ..sample_window("empty", 3, 0)
+        };
+        assert!(window_is_displayable(&visible));
+        assert!(!window_is_displayable(&hidden));
+        assert!(!window_is_displayable(&empty));
     }
 }

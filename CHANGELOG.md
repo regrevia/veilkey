@@ -1,3 +1,9 @@
+## 0.2.7 - 2026-10-19
+
+- Default the interface to Chinese and add a persistent English switch.
+- Filter hidden and zero-size windows from the available-window list.
+- Add list-selection and individual-window binding modes.
+
 ## 0.2.6 - 2026-10-19
 
 - Retry transient native window operations once before reporting failure.
@@ -42,6 +48,7 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 
 
 

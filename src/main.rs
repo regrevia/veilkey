@@ -18,6 +18,7 @@ struct VeilKeyApp {
     filter: String,
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
+    recording_group: Option<usize>,
 }
 
 impl VeilKeyApp {
@@ -50,6 +51,7 @@ impl VeilKeyApp {
             filter: String::new(),
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
+            recording_group: None,
         };
         app.register_saved_hotkeys();
         let _ = app.refresh_tx.send(());
@@ -183,6 +185,53 @@ impl VeilKeyApp {
         }
     }
 
+    fn capture_hotkey(&mut self, ctx: &egui::Context) {
+        let Some(index) = self.recording_group else {
+            return;
+        };
+        let captured = ctx.input(|input| {
+            input.events.iter().find_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+        });
+        let Some((key, modifiers)) = captured else {
+            return;
+        };
+        let debug_name = format!("{key:?}");
+        let key_name = if debug_name.len() == 1 && debug_name.as_bytes()[0].is_ascii_uppercase() {
+            format!("Key{debug_name}")
+        } else {
+            debug_name
+        };
+        let mut parts = Vec::new();
+        if modifiers.ctrl || modifiers.mac_cmd {
+            parts.push("ctrl");
+        }
+        if modifiers.alt {
+            parts.push("alt");
+        }
+        if modifiers.shift {
+            parts.push("shift");
+        }
+        if modifiers.command && !modifiers.mac_cmd {
+            parts.push("super");
+        }
+        parts.push(key_name.as_str());
+        let value = parts.join("+");
+        self.recording_group = None;
+        if let Some(group) = self.state.groups.get_mut(index) {
+            group.hotkey_draft = value.clone();
+        }
+        self.register_group_hotkey(index, value);
+    }
+
     fn toggle_group(&mut self, index: usize) {
         let actions = self.state.toggle_group(index, &self.windows);
         if actions.is_empty() {
@@ -239,6 +288,7 @@ impl eframe::App for VeilKeyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.update_window_snapshot();
         self.retry_hotkeys_if_needed();
+        self.capture_hotkey(ctx);
         self.handle_hotkey_events();
         ctx.request_repaint_after(Duration::from_millis(100));
 
@@ -322,6 +372,18 @@ impl eframe::App for VeilKeyApp {
                         );
                         if ui.small_button("Bind").clicked() {
                             hotkey_save = Some((index, group.hotkey_draft.clone()));
+                        }
+                        if ui
+                            .small_button(if self.recording_group == Some(index) {
+                                "Press a key…"
+                            } else {
+                                "Record"
+                            })
+                            .clicked()
+                        {
+                            self.recording_group = Some(index);
+                            self.state.status =
+                                "Press a key combination to bind this group.".into();
                         }
                     });
                     let force_popup = ui.add_enabled(

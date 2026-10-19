@@ -1,3 +1,8 @@
+## 0.2.4 - 2026-10-19
+
+- Add in-app shortcut recording so groups can be bound by pressing a key combination.
+- Keep shortcut capture and registration errors visible in the status bar.
+
 ## 0.2.3 - 2026-10-19
 
 - Match moved Windows windows by stable HWND identity even when their sort order changes.
@@ -27,5 +32,6 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 
 

@@ -80,11 +80,3 @@ jobs:
             gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$($release.tag_name)"
             if ($LASTEXITCODE -ne 0) { throw "Unable to delete preview tag $($release.tag_name)." }
           }
-      - uses: actions/upload-artifact@v4
-        with:
-          name: VeilKey-Windows-preview-${{ steps.release.outputs.short_sha }}
-          path: |
-            packaging/output/VeilKey-Setup-*-windows-x64.exe
-            packaging/output/VeilKey-[0-9]*-windows-x64.exe
-          if-no-files-found: error
-          retention-days: 14

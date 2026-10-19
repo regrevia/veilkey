@@ -1,3 +1,7 @@
+## 0.2.21 - 2026-10-19
+
+- Wait for Windows visibility changes to reach the native window state before refreshing snapshots and processing queued shortcuts; report bounded timeouts for unresponsive windows.
+
 ## 0.2.20 - 2026-10-19
 
 - Track shortcut recording targets by group name so deleting an earlier group cannot redirect a pending binding to a different group.

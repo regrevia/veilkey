@@ -182,11 +182,12 @@ impl NativeWindowController {
                                     | SWP_SHOWWINDOW
                                     | SWP_NOOWNERZORDER,
                             )
-                            .map_err(|e| e.to_string())
+                            .map_err(|e| e.to_string())?;
+                            wait_for_visibility(hwnd, true)
                         } else {
                             // Do not touch z-order for the default game-friendly path.
                             let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
-                            Ok(())
+                            wait_for_visibility(hwnd, true)
                         }
                     } else {
                         if force_popup {
@@ -201,7 +202,7 @@ impl NativeWindowController {
                             );
                         }
                         let _ = ShowWindowAsync(hwnd, SW_HIDE);
-                        Ok(())
+                        wait_for_visibility(hwnd, false)
                     }
                 },
                 WindowAction::SetRect { rect, .. } => {
@@ -250,6 +251,25 @@ impl NativeWindowController {
             ))
         }
     }
+}
+
+fn wait_for_visibility(hwnd: HWND, visible: bool) -> Result<(), String> {
+    for _ in 0..30 {
+        unsafe {
+            if !IsWindow(hwnd).as_bool() {
+                return Err("Window closed before its visibility change completed.".into());
+            }
+            if IsWindowVisible(hwnd).as_bool() == visible {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    Err(if visible {
+        "Timed out waiting for the window to become visible.".into()
+    } else {
+        "Timed out waiting for the window to hide.".into()
+    })
 }
 
 fn same_window_id(current: &str, saved: &str) -> bool {

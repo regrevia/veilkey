@@ -99,6 +99,10 @@ fn pending_hotkeys(groups: &[Group], registered_ids: &HashSet<u32>) -> Vec<(Stri
         .collect()
 }
 
+fn group_index_by_name(groups: &[Group], name: &str) -> Option<usize> {
+    groups.iter().position(|group| group.name == name)
+}
+
 fn is_modifier(key: rdev::Key) -> bool {
     matches!(
         key,
@@ -196,7 +200,7 @@ struct VeilKeyApp {
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
     registered_hotkey_ids: HashSet<u32>,
-    recording_group: Option<usize>,
+    recording_group: Option<String>,
     settings_open: bool,
     capture_armed: Arc<AtomicBool>,
     capture_listener_alive: Arc<AtomicBool>,
@@ -205,7 +209,7 @@ struct VeilKeyApp {
     focused_binding_rx: Receiver<FocusedBindingLookup>,
     focused_binding_tx: mpsc::Sender<FocusedBindingLookup>,
     focused_binding_in_flight: bool,
-    pending_bind_group: Option<usize>,
+    pending_bind_group: Option<String>,
     action_tx: mpsc::SyncSender<Vec<WindowAction>>,
     action_rx: Receiver<ActionCompletion>,
     action_in_flight: bool,
@@ -554,8 +558,17 @@ impl VeilKeyApp {
             }
             Ok(chord) => {
                 self.capture_armed.store(false, Ordering::Release);
-                if let Some(index) = self.pending_bind_group.take() {
-                    self.register_group_hotkey(index, chord);
+                if let Some(group_name) = self.pending_bind_group.take() {
+                    if let Some(index) = group_index_by_name(&self.state.groups, &group_name) {
+                        self.register_group_hotkey(index, chord);
+                    } else {
+                        self.state.status = tr(
+                            english,
+                            "The target group was removed before the shortcut was recorded.",
+                            "录制快捷键前，目标窗口组已被删除。",
+                        )
+                        .into();
+                    }
                 } else {
                     self.state.status = tr(
                         english,
@@ -684,7 +697,7 @@ impl VeilKeyApp {
     }
 
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
-        let Some(index) = self.recording_group else {
+        let Some(group_name) = self.recording_group.clone() else {
             return;
         };
         let captured = ctx.input(|input| {
@@ -730,6 +743,15 @@ impl VeilKeyApp {
         parts.push(key_name.as_str());
         let value = parts.join("+");
         self.recording_group = None;
+        let Some(index) = group_index_by_name(&self.state.groups, &group_name) else {
+            self.state.status = tr(
+                self.state.english_ui,
+                "The target group was removed before the shortcut was recorded.",
+                "录制快捷键前，目标窗口组已被删除。",
+            )
+            .into();
+            return;
+        };
         if let Some(group) = self.state.groups.get_mut(index) {
             group.hotkey_draft = value.clone();
         }
@@ -986,14 +1008,14 @@ impl eframe::App for VeilKeyApp {
                             hotkey_save = Some((index, group.hotkey_draft.clone()));
                         }
                         if ui
-                            .small_button(if self.recording_group == Some(index) {
+                            .small_button(if self.recording_group.as_deref() == Some(&group.name) {
                                 tr(english, "Press keys…", "请按快捷键…")
                             } else {
                                 tr(english, "Record", "录制")
                             })
                             .clicked()
                         {
-                            self.recording_group = Some(index);
+                            self.recording_group = Some(group.name.clone());
                             self.state.status =
                                 tr(english, "Press the shortcut now.", "请按下要绑定的快捷键。")
                                     .into();
@@ -1145,10 +1167,9 @@ impl eframe::App for VeilKeyApp {
                         suffix += 1;
                     }
                     self.state.selected_windows.insert(window_id);
-                    if self.state.create_group(name) {
-                        let index = self.state.groups.len() - 1;
+                    if self.state.create_group(name.clone()) {
                         self.recording_group = None;
-                        self.pending_bind_group = Some(index);
+                        self.pending_bind_group = Some(name);
                         self.capture_armed.store(true, Ordering::Release);
                         self.state.status = tr(
                             english,
@@ -1247,5 +1268,17 @@ mod tests {
         assert!(!enqueue_toggle(&mut queue, "C", 3));
         assert!(enqueue_toggle(&mut queue, "A", 3));
         assert_eq!(queue, VecDeque::from(["A", "B"]));
+    }
+
+    #[test]
+    fn pending_shortcut_recording_tracks_group_identity_after_deletion() {
+        let groups = [
+            group("First", "ctrl+alt+KeyA"),
+            group("Target", "ctrl+alt+KeyB"),
+        ];
+        assert_eq!(group_index_by_name(&groups, "Target"), Some(1));
+        let groups_after_delete = [group("Target", "ctrl+alt+KeyB")];
+        assert_eq!(group_index_by_name(&groups_after_delete, "Target"), Some(0));
+        assert_eq!(group_index_by_name(&groups_after_delete, "Deleted"), None);
     }
 }

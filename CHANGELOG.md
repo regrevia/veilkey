@@ -1,3 +1,7 @@
+## 0.2.20 - 2026-10-19
+
+- Track shortcut recording targets by group name so deleting an earlier group cannot redirect a pending binding to a different group.
+
 ## 0.2.19 - 2026-10-19
 
 - Move focused-window discovery after shortcut capture to a background task so slow macOS Accessibility queries do not freeze the interface.

@@ -452,6 +452,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn repeated_desktop_enumeration_returns_unique_window_identities() {
+        for _ in 0..50 {
+            let windows = NativeWindowController::enumerate().expect("enumerate desktop windows");
+            let mut handles = std::collections::HashSet::new();
+            let mut ids = std::collections::HashSet::new();
+            for window in windows {
+                assert!(handles.insert(window.native_handle));
+                assert!(ids.insert(window.id));
+            }
+        }
+    }
+
+    #[test]
     fn workspace_screen_conversion_round_trips_negative_monitor_coordinates() {
         // A secondary monitor left and above the primary display, with taskbars
         // consuming space from the left and top edges of its work area.

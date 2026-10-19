@@ -63,6 +63,18 @@ fn localized_status(english: bool, status: &str) -> String {
                 status.trim_start_matches("Window operation failed unexpectedly:")
             )
         }
+        _ if status.starts_with("Window enumeration failed unexpectedly:") => {
+            format!(
+                "窗口列表刷新遇到意外错误，正在稍后重试：{}",
+                status.trim_start_matches("Window enumeration failed unexpectedly:")
+            )
+        }
+        _ if status.starts_with("Focused window lookup failed unexpectedly:") => {
+            format!(
+                "识别前台窗口时遇到意外错误：{}",
+                status.trim_start_matches("Focused window lookup failed unexpectedly:")
+            )
+        }
         _ => status.to_owned(),
     }
 }
@@ -86,6 +98,53 @@ fn request_window_refresh(sender: &mpsc::SyncSender<()>) {
 
 fn snapshot_is_current(snapshot_generation: u64, current_generation: u64) -> bool {
     snapshot_generation == current_generation && current_generation.is_multiple_of(2)
+}
+
+fn enumerate_windows_resiliently<F>(enumerate: F) -> Result<Vec<WindowInfo>, String>
+where
+    F: FnOnce() -> Result<Vec<WindowInfo>, String>,
+{
+    match catch_unwind(AssertUnwindSafe(enumerate)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unexpected panic");
+            Err(format!("Window enumeration failed unexpectedly: {detail}"))
+        }
+    }
+}
+
+fn lookup_focused_window_resiliently<F>(
+    lookup: F,
+) -> (
+    Result<Option<String>, String>,
+    Result<Vec<WindowInfo>, String>,
+)
+where
+    F: FnOnce() -> (
+        Result<Option<String>, String>,
+        Result<Vec<WindowInfo>, String>,
+    ),
+{
+    match catch_unwind(AssertUnwindSafe(lookup)) {
+        Ok(result) => result,
+        Err(payload) => {
+            let detail = payload
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| payload.downcast_ref::<&str>().copied())
+                .unwrap_or("unexpected panic");
+            (
+                Err(format!(
+                    "Focused window lookup failed unexpectedly: {detail}"
+                )),
+                Err("Window enumeration was skipped after a focused-window lookup failure.".into()),
+            )
+        }
+    }
 }
 
 struct OperationGenerationGuard<'a> {
@@ -305,7 +364,7 @@ impl VeilKeyApp {
             {
                 while refresh_rx.try_recv().is_ok() {}
                 let generation = refresh_generation.load(Ordering::Acquire);
-                let snapshot = NativeWindowController::enumerate();
+                let snapshot = enumerate_windows_resiliently(NativeWindowController::enumerate);
                 if window_tx.send((generation, snapshot)).is_err() {
                     break;
                 }
@@ -327,7 +386,7 @@ impl VeilKeyApp {
                             Err(second) => Err(format!("{first}; retry failed: {second}")),
                         },
                     };
-                    let snapshot = NativeWindowController::enumerate();
+                    let snapshot = enumerate_windows_resiliently(NativeWindowController::enumerate);
                     (applied, snapshot)
                 });
                 if action_results.send(completion).is_err() {
@@ -657,12 +716,15 @@ impl VeilKeyApp {
                     self.focused_binding_in_flight = true;
                     let sender = self.focused_binding_tx.clone();
                     thread::spawn(move || {
-                        let focused = NativeWindowController::foreground_window_id();
-                        let windows = if matches!(focused, Ok(Some(_))) {
-                            NativeWindowController::enumerate()
-                        } else {
-                            Ok(Vec::new())
-                        };
+                        let (focused, windows) = lookup_focused_window_resiliently(|| {
+                            let focused = NativeWindowController::foreground_window_id();
+                            let windows = if matches!(focused, Ok(Some(_))) {
+                                enumerate_windows_resiliently(NativeWindowController::enumerate)
+                            } else {
+                                Ok(Vec::new())
+                            };
+                            (focused, windows)
+                        });
                         let _ = sender.send((chord, focused, windows));
                     });
                 }
@@ -1390,6 +1452,29 @@ mod tests {
         assert!(snapshot_is_current(generation, generation));
         assert!(applied.unwrap_err().contains("simulated worker fault"));
         assert!(snapshot.is_err());
+    }
+
+    #[test]
+    fn panicking_window_enumeration_returns_an_error_and_later_calls_can_succeed() {
+        let failed: Result<Vec<WindowInfo>, _> =
+            enumerate_windows_resiliently(|| panic!("simulated enumeration fault"));
+        assert!(failed.unwrap_err().contains("simulated enumeration fault"));
+
+        let recovered = enumerate_windows_resiliently(|| Ok(Vec::new()));
+        assert_eq!(recovered.unwrap(), Vec::<WindowInfo>::new());
+    }
+
+    #[test]
+    fn panicking_focused_window_lookup_returns_a_completion_error() {
+        let (focused, windows) =
+            lookup_focused_window_resiliently(|| panic!("simulated focused-window fault"));
+
+        assert!(
+            focused
+                .unwrap_err()
+                .contains("simulated focused-window fault")
+        );
+        assert!(windows.is_err());
     }
 
     #[test]

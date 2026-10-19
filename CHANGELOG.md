@@ -1,6 +1,8 @@
 ## Unreleased
 
 - Recover the Windows window-operation worker from a per-operation panic, restore snapshot generation state, and report the failure instead of leaving shortcuts permanently busy.
+- Keep periodic window discovery alive after an enumeration panic and surface a retryable status instead of silently freezing the window list.
+- Return a completed binding error when focused-window discovery panics, so shortcut recording cannot remain stuck in a loading state.
 - Revalidate the owning process immediately before Windows window operations so a recycled native handle cannot target another process.
 - Discard stale window snapshots that race with native window-group operations, keeping shortcut decisions aligned with the latest completed state.
 - Exercise repeated Windows desktop enumeration and verify each snapshot contains unique native window identities.

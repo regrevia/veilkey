@@ -174,6 +174,13 @@ impl NativeWindowController {
                 continue;
             };
             let hwnd = HWND(handle as *mut core::ffi::c_void);
+            if !window_handle_matches_process(hwnd, &window.id) {
+                errors.push(format!(
+                    "Window '{}' changed while the operation was starting; refresh and retry.",
+                    window.title
+                ));
+                continue;
+            }
             let result = match action {
                 WindowAction::SetVisible {
                     visible,
@@ -286,6 +293,29 @@ impl NativeWindowController {
                 errors.join("; ")
             ))
         }
+    }
+}
+
+fn expected_process_id(window_id: &str) -> Option<u32> {
+    let (_, identity) = window_id.rsplit_once("|hwnd:")?;
+    identity
+        .split('|')
+        .find_map(|part| part.strip_prefix("pid:"))?
+        .parse()
+        .ok()
+}
+
+fn window_handle_matches_process(hwnd: HWND, window_id: &str) -> bool {
+    let Some(expected_pid) = expected_process_id(window_id) else {
+        return false;
+    };
+    unsafe {
+        if !IsWindow(hwnd).as_bool() {
+            return false;
+        }
+        let mut actual_pid = 0u32;
+        GetWindowThreadProcessId(hwnd, Some(&mut actual_pid));
+        actual_pid != 0 && actual_pid == expected_pid
     }
 }
 
@@ -477,5 +507,15 @@ mod tests {
         let workspace_rect = translate_rect(screen_rect, -48, -40);
         let restored_screen_rect = translate_rect(workspace_rect, 48, 40);
         assert_eq!(restored_screen_rect, screen_rect);
+    }
+
+    #[test]
+    fn parses_process_identity_from_current_and_legacy_window_ids() {
+        assert_eq!(
+            expected_process_id("app.exe\\0title\\00|hwnd:1a2b|pid:42"),
+            Some(42)
+        );
+        assert_eq!(expected_process_id("app.exe\\0title\\00|hwnd:1a2b"), None);
+        assert_eq!(expected_process_id("app.exe\\0title\\00"), None);
     }
 }

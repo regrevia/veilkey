@@ -35,7 +35,7 @@ pub struct WindowPreview {
 }
 
 pub fn bgra_to_rgba(mut pixels: Vec<u8>) -> Vec<u8> {
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     pixels

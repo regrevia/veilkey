@@ -152,8 +152,16 @@ impl VeilKeyApp {
     }
 
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
-        if let Err(error) = NativeWindowController::apply_actions(actions) {
-            self.state.status = error;
+        let retry = actions.clone();
+        if let Err(first_error) = NativeWindowController::apply_actions(actions) {
+            // Window handles can briefly be stale while an app creates or restores a
+            // child window. The operations are idempotent, so one immediate retry is
+            // safe and avoids making a transient native error visible to the user.
+            if let Err(second_error) = NativeWindowController::apply_actions(retry) {
+                self.state.status = format!("{first_error}; retry failed: {second_error}");
+            } else {
+                self.state.status = "Window state recovered after a brief retry.".into();
+            }
         }
         // Native window managers may reject or asynchronously apply an operation.
         // A fresh snapshot keeps the next toggle based on observed OS state.

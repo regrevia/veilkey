@@ -1,3 +1,8 @@
+## 0.2.6 - 2026-10-19
+
+- Retry transient native window operations once before reporting failure.
+- Preserve a backup when the settings file is corrupt, then recover with defaults.
+
 ## 0.2.5 - 2026-10-19
 
 - Simplify the group and shortcut binding interface.
@@ -37,6 +42,7 @@
 ## 0.1.0
 
 - Initial clean-room VeilKey project.
+
 
 
 

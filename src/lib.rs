@@ -190,10 +190,19 @@ pub fn state_path() -> PathBuf {
 }
 
 pub fn load_state(path: &Path) -> AppState {
-    fs::read(path)
-        .ok()
-        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+    let Ok(bytes) = fs::read(path) else {
+        return AppState::default();
+    };
+    match serde_json::from_slice(&bytes) {
+        Ok(state) => state,
+        Err(_) => {
+            // Preserve a damaged file for diagnosis instead of silently destroying
+            // the user's groups when the next save replaces it.
+            let backup = path.with_extension(format!("json.corrupt-{}", std::process::id()));
+            let _ = fs::copy(path, backup);
+            AppState::default()
+        }
+    }
 }
 
 pub fn save_state(path: &Path, state: &AppState) -> io::Result<()> {
@@ -394,6 +403,19 @@ mod tests {
             "veilkey-concurrent-{}.json.lock",
             std::process::id()
         )));
+    }
+
+    #[test]
+    fn corrupt_state_is_preserved_before_recovery() {
+        let path =
+            std::env::temp_dir().join(format!("veilkey-corrupt-{}.json", std::process::id()));
+        let backup = path.with_extension(format!("json.corrupt-{}", std::process::id()));
+        fs::write(&path, b"{not valid json").unwrap();
+        let recovered = load_state(&path);
+        assert!(recovered.groups.is_empty());
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{not valid json");
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(backup);
     }
 
     #[test]

@@ -1,3 +1,8 @@
+## 0.2.11 - 2026-10-19
+
+- Protect Windows window bindings against recycled native handles by including the owning process ID in new window identities.
+- Retain compatibility with existing saved window bindings.
+
 ## 0.2.10 - 2026-10-19
 
 - Preserve working global shortcuts while retrying only registrations that failed, preventing recovery attempts from disabling active bindings.

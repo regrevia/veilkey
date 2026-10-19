@@ -16,6 +16,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 #[derive(Clone)]
 struct RawWindow {
     hwnd: HWND,
+    pid: u32,
     title: String,
     app: String,
     rect: Rect,
@@ -65,6 +66,7 @@ impl NativeWindowController {
                 let app = process_name(pid);
                 raw.push(RawWindow {
                     hwnd,
+                    pid,
                     title,
                     app,
                     rect: Rect {
@@ -94,11 +96,12 @@ impl NativeWindowController {
                 // remain readable, then add the HWND.  The old ordinal changed when
                 // a window moved; HWND stays stable for the lifetime of that window.
                 let id = format!(
-                    "{}\0{}\0{}|hwnd:{:x}",
+                    "{}\0{}\0{}|hwnd:{:x}|pid:{}",
                     w.app.to_lowercase(),
                     w.title,
                     *ordinal,
-                    w.hwnd.0 as usize
+                    w.hwnd.0 as usize,
+                    w.pid
                 );
                 *ordinal += 1;
                 let visible = unsafe { IsWindowVisible(w.hwnd).as_bool() };
@@ -253,10 +256,28 @@ fn same_window_id(current: &str, saved: &str) -> bool {
     if current == saved {
         return true;
     }
-    if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
-        return current
-            .rsplit_once("|hwnd:")
-            .is_some_and(|(_, current_handle)| current_handle == saved_handle);
+    if let Some((_, saved_identity)) = saved.rsplit_once("|hwnd:") {
+        let Some((_, current_identity)) = current.rsplit_once("|hwnd:") else {
+            return false;
+        };
+        let saved_parts: Vec<_> = saved_identity.split('|').collect();
+        let current_parts: Vec<_> = current_identity.split('|').collect();
+        if saved_parts[0] != current_parts[0] {
+            return false;
+        }
+        let saved_pid = saved_parts
+            .iter()
+            .find_map(|part| part.strip_prefix("pid:"));
+        let current_pid = current_parts
+            .iter()
+            .find_map(|part| part.strip_prefix("pid:"));
+        return match (saved_pid, current_pid) {
+            (Some(saved_pid), Some(current_pid)) => saved_pid == current_pid,
+            // Older bindings only stored the HWND. Keep them usable until users
+            // rebind, while all newly created IDs protect against handle reuse.
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
     }
     current.starts_with(&format!("{saved}|hwnd:"))
 }

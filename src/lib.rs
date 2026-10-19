@@ -176,9 +176,25 @@ fn same_window_id(current: &str, saved: &str) -> bool {
     // Windows bindings carry a stable HWND suffix. The app/title/ordinal prefix
     // may change when a same-titled window moves and is re-sorted.
     if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
-        return current
-            .rsplit_once("|hwnd:")
-            .is_some_and(|(_, current_handle)| current_handle == saved_handle);
+        let Some((_, current_handle)) = current.rsplit_once("|hwnd:") else {
+            return false;
+        };
+        let saved_parts: Vec<_> = saved_handle.split('|').collect();
+        let current_parts: Vec<_> = current_handle.split('|').collect();
+        if saved_parts[0] != current_parts[0] {
+            return false;
+        }
+        let saved_pid = saved_parts
+            .iter()
+            .find_map(|part| part.strip_prefix("pid:"));
+        let current_pid = current_parts
+            .iter()
+            .find_map(|part| part.strip_prefix("pid:"));
+        return match (saved_pid, current_pid) {
+            (Some(saved_pid), Some(current_pid)) => saved_pid == current_pid,
+            (Some(_), None) => false,
+            (None, _) => true,
+        };
     }
     // Keep 0.2.0/0.2.1 IDs readable while users migrate their groups.
     current.starts_with(&format!("{saved}\0")) || current.starts_with(&format!("{saved}|hwnd:"))
@@ -473,6 +489,20 @@ mod tests {
             actions[0],
             WindowAction::SetVisible { visible: false, .. }
         ));
+    }
+
+    #[test]
+    fn group_toggle_does_not_match_reused_handle_from_another_process() {
+        let mut state = AppState::default();
+        state
+            .selected_windows
+            .insert(format!("mumu\0Player\0{}|hwnd:2a|pid:100", 0));
+        assert!(state.create_group("MuMu set".into()));
+        let reused_handle = [WindowInfo {
+            id: format!("mumu\0Player\0{}|hwnd:2a|pid:200", 0),
+            ..sample_window("ignored", 0x2a, 500)
+        }];
+        assert!(state.toggle_group(0, &reused_handle).is_empty());
     }
 
     #[test]

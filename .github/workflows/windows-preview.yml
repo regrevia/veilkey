@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   package:
@@ -39,9 +39,49 @@ jobs:
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portable.FullName).Hash
           $installer = Get-Item "packaging/output/VeilKey-Setup-$version-windows-x64.exe"
           .\packaging\windows\smoke-test-installer.ps1 -InstallerPath $installer.FullName -ExpectedExecutableSha256 $hash
+      - name: Prepare preview release metadata
+        id: release
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
+          $shortSha = $env:GITHUB_SHA.Substring(0, 7)
+          $tag = "windows-preview-$env:GITHUB_RUN_NUMBER-$env:GITHUB_RUN_ATTEMPT"
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "short_sha=$shortSha" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+      - name: Publish Windows preview release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: Windows preview ${{ steps.release.outputs.short_sha }}
+          prerelease: true
+          generate_release_notes: false
+          fail_on_unmatched_files: true
+          files: |
+            packaging/output/VeilKey-Setup-${{ steps.release.outputs.version }}-windows-x64.exe
+            packaging/output/VeilKey-${{ steps.release.outputs.version }}-windows-x64.exe
+      - name: Keep only the latest 10 Windows preview releases
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if (-not (Get-Command gh -ErrorAction SilentlyContinue)) {
+            throw 'GitHub CLI is not available on the runner.'
+          }
+          $releases = gh api "repos/$env:GITHUB_REPOSITORY/releases?per_page=100" | ConvertFrom-Json
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to list GitHub Releases.' }
+          $previewReleases = @($releases | Where-Object {
+            $_.prerelease -and $_.tag_name -like 'windows-preview-*'
+          } | Sort-Object { [DateTimeOffset]::Parse($_.created_at) } -Descending)
+          foreach ($release in ($previewReleases | Select-Object -Skip 10)) {
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/releases/$($release.id)"
+            if ($LASTEXITCODE -ne 0) { throw "Unable to delete preview release $($release.tag_name)." }
+            gh api --method DELETE "repos/$env:GITHUB_REPOSITORY/git/refs/tags/$($release.tag_name)"
+            if ($LASTEXITCODE -ne 0) { throw "Unable to delete preview tag $($release.tag_name)." }
+          }
       - uses: actions/upload-artifact@v4
         with:
-          name: VeilKey-Windows-preview
+          name: VeilKey-Windows-preview-${{ steps.release.outputs.short_sha }}
           path: |
             packaging/output/VeilKey-Setup-*-windows-x64.exe
             packaging/output/VeilKey-[0-9]*-windows-x64.exe

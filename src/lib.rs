@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod platform;
 
@@ -29,6 +30,8 @@ pub struct Group {
     pub name: String,
     pub window_ids: BTreeSet<String>,
     pub hotkey: Option<String>,
+    #[serde(skip)]
+    pub hotkey_draft: String,
     pub is_visible: bool,
     #[serde(default)]
     pub force_popup: bool,
@@ -78,6 +81,7 @@ impl AppState {
             name: name.to_owned(),
             window_ids: std::mem::take(&mut self.selected_windows),
             hotkey: None,
+            hotkey_draft: String::new(),
             is_visible: true,
             force_popup: false,
             restore_rects: BTreeMap::new(),
@@ -100,7 +104,12 @@ impl AppState {
         {
             return actions;
         }
-        if group.is_visible {
+        let any_visible = group
+            .window_ids
+            .iter()
+            .filter_map(|id| current.get(id.as_str()))
+            .any(|window| window.visible);
+        if any_visible {
             group.restore_rects.clear();
             for id in &group.window_ids {
                 if let Some(window) = current.get(id.as_str()).filter(|w| w.visible) {
@@ -178,17 +187,41 @@ pub fn load_state(path: &Path) -> AppState {
 }
 
 pub fn save_state(path: &Path, state: &AppState) -> io::Result<()> {
+    static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "state file has no parent"))?;
     fs::create_dir_all(parent)?;
-    let temp = path.with_extension("json.tmp");
+    let lock_path = path.with_extension("json.lock");
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)?;
+    fs2::FileExt::lock_exclusive(&lock_file)?;
+    let mut temp_name = path.as_os_str().to_os_string();
+    temp_name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temp = PathBuf::from(temp_name);
     let bytes = serde_json::to_vec_pretty(state).map_err(io::Error::other)?;
-    let mut file = fs::File::create(&temp)?;
-    file.write_all(&bytes)?;
-    file.sync_all()?;
-    drop(file);
-    replace_state_file(&temp, path)
+    let result = (|| {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_state_file(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp);
+    }
+    let unlock_result = fs2::FileExt::unlock(&lock_file);
+    result?;
+    unlock_result?;
+    Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -317,10 +350,61 @@ mod tests {
         let path = std::env::temp_dir().join(format!("veilkey-state-{}.json", std::process::id()));
         save_state(&path, &state).unwrap();
         let loaded = load_state(&path);
-        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_file(path.with_extension("json.lock"));
         assert_eq!(loaded.groups, state.groups);
         assert!(loaded.selected_windows.is_empty());
         assert!(loaded.new_group_name.is_empty());
         assert!(loaded.status.is_empty());
+    }
+
+    #[test]
+    fn concurrent_state_saves_never_share_temporary_files_or_corrupt_json() {
+        let path =
+            std::env::temp_dir().join(format!("veilkey-concurrent-{}.json", std::process::id()));
+        let writers: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut state = AppState::default();
+                    state.selected_windows.insert(format!("window-{index}"));
+                    assert!(state.create_group(format!("Group {index}")));
+                    save_state(&path, &state).unwrap();
+                })
+            })
+            .collect();
+        for writer in writers {
+            writer.join().unwrap();
+        }
+        let loaded = load_state(&path);
+        assert_eq!(loaded.groups.len(), 1);
+        assert!(loaded.groups[0].name.starts_with("Group "));
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_file(std::env::temp_dir().join(format!(
+            "veilkey-concurrent-{}.json.lock",
+            std::process::id()
+        )));
+    }
+
+    #[test]
+    fn group_toggle_recovers_when_saved_visibility_is_stale() {
+        let mut state = AppState::default();
+        state.selected_windows.extend(["a".into(), "b".into()]);
+        assert!(state.create_group("MuMu set".into()));
+        // Saved state says shown, but the OS says one group window is already hidden.
+        let windows = [
+            sample_window("a", 1, 10),
+            WindowInfo {
+                visible: false,
+                ..sample_window("b", 2, 900)
+            },
+        ];
+        let actions = state.toggle_group(0, &windows);
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(
+            actions[0],
+            WindowAction::SetVisible { visible: false, .. }
+        ));
+        assert!(!state.groups[0].is_visible);
     }
 }

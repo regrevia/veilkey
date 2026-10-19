@@ -11,8 +11,8 @@ use veilkey::{AppState, WindowAction, WindowInfo, load_state, save_state, state_
 struct VeilKeyApp {
     state: AppState,
     windows: Vec<WindowInfo>,
-    last_refresh: std::time::Instant,
     window_rx: Receiver<Result<Vec<WindowInfo>, String>>,
+    refresh_tx: mpsc::Sender<()>,
     hotkeys: Option<GlobalHotKeyManager>,
     state_file: std::path::PathBuf,
     filter: String,
@@ -21,24 +21,28 @@ struct VeilKeyApp {
 impl VeilKeyApp {
     fn new() -> Self {
         let state_file = state_path();
-        let state = load_state(&state_file);
+        let mut state = load_state(&state_file);
+        for group in &mut state.groups {
+            group.hotkey_draft = group.hotkey.clone().unwrap_or_default();
+        }
         // A slow Accessibility query must never let stale snapshots accumulate.
         let (window_tx, window_rx) = mpsc::sync_channel(1);
+        let (refresh_tx, refresh_rx) = mpsc::channel();
         thread::spawn(move || {
-            loop {
-                match window_tx.try_send(NativeWindowController::enumerate()) {
-                    Ok(()) | Err(mpsc::TrySendError::Full(_)) => {}
-                    Err(mpsc::TrySendError::Disconnected(_)) => break,
+            while let Ok(()) | Err(mpsc::RecvTimeoutError::Timeout) =
+                refresh_rx.recv_timeout(Duration::from_secs(2))
+            {
+                if window_tx.send(NativeWindowController::enumerate()).is_err() {
+                    break;
                 }
-                thread::sleep(Duration::from_secs(2));
             }
         });
         let hotkeys = GlobalHotKeyManager::new().ok();
         let mut app = Self {
             state,
             windows: Vec::new(),
-            last_refresh: std::time::Instant::now(),
             window_rx,
+            refresh_tx,
             hotkeys,
             state_file,
             filter: String::new(),
@@ -120,6 +124,7 @@ impl VeilKeyApp {
             Ok(()) => {
                 if let Some(group) = self.state.groups.get_mut(index) {
                     group.hotkey = Some(value);
+                    group.hotkey_draft = group.hotkey.clone().unwrap_or_default();
                 }
                 self.state.status = "Shortcut registered.".into();
                 self.persist();
@@ -187,7 +192,6 @@ impl VeilKeyApp {
             match result {
                 Ok(windows) => {
                     self.windows = windows;
-                    self.last_refresh = std::time::Instant::now();
                 }
                 Err(error) => self.state.status = error,
             }
@@ -212,7 +216,7 @@ impl eframe::App for VeilKeyApp {
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("Refresh windows").clicked() {
-                        self.last_refresh = std::time::Instant::now() - Duration::from_secs(3);
+                        let _ = self.refresh_tx.send(());
                     }
                     ui.label(format!("{} windows", self.windows.len()));
                 });
@@ -274,37 +278,39 @@ impl eframe::App for VeilKeyApp {
                     });
                     ui.horizontal(|ui| {
                         ui.label("Shortcut");
-                        let mut value = group.hotkey.clone().unwrap_or_default();
                         ui.add(
-                            egui::TextEdit::singleline(&mut value)
+                            egui::TextEdit::singleline(&mut group.hotkey_draft)
                                 .hint_text("ctrl+alt+KeyH")
                                 .desired_width(150.0),
                         );
                         if ui.small_button("Bind").clicked() {
-                            hotkey_save = Some((index, value));
+                            hotkey_save = Some((index, group.hotkey_draft.clone()));
                         }
                     });
-                    if ui
-                        .checkbox(
+                    let force_popup = ui.add_enabled(
+                        cfg!(target_os = "windows"),
+                        egui::Checkbox::new(
                             &mut group.force_popup,
                             "Force popup (keep above, don't focus)",
-                        )
-                        .changed()
-                    {
+                        ),
+                    );
+                    let force_popup_changed = force_popup.changed();
+                    force_popup.on_hover_text(
+                        "Windows only. On macOS, window stacking is controlled by the system.",
+                    );
+                    if force_popup_changed {
                         group_option_changed = true;
                     }
                 }
                 if let Some(index) = delete {
-                    if let Some(group) = self.state.groups.get(index) {
-                        if let Some(hotkey) = group
+                    if let Some(group) = self.state.groups.get(index)
+                        && let Some(hotkey) = group
                             .hotkey
                             .as_deref()
                             .and_then(|s| HotKey::from_str(s).ok())
-                        {
-                            if let Some(manager) = &self.hotkeys {
-                                let _ = manager.unregister(hotkey);
-                            }
-                        }
+                        && let Some(manager) = &self.hotkeys
+                    {
+                        let _ = manager.unregister(hotkey);
                     }
                     self.state.groups.remove(index);
                     self.persist();
@@ -390,10 +396,12 @@ impl eframe::App for VeilKeyApp {
 }
 
 fn main() -> eframe::Result {
-    let mut options = eframe::NativeOptions::default();
-    options.viewport = egui::ViewportBuilder::default()
-        .with_inner_size([1000.0, 680.0])
-        .with_min_inner_size([780.0, 520.0]);
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1000.0, 680.0])
+            .with_min_inner_size([780.0, 520.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "VeilKey",
         options,

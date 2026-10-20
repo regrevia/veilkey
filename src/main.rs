@@ -30,6 +30,9 @@ fn localized_status(english: bool, status: &str) -> String {
     match status {
         "Shortcut registered." => "快捷键已绑定。".into(),
         "Dynamic shortcut ranges registered." => "快捷键范围已生效。".into(),
+        "Shortcut range saved. Select a dynamic mode to activate it." => {
+            "快捷键范围已保存；切换到动态模式后即可启用。".into()
+        }
         "VeilKey was updated. Re-enable Accessibility and Screen Recording permissions." => {
             "VeilKey 已更新并重置授权，请重新开启辅助功能和屏幕录制权限。".into()
         }
@@ -60,6 +63,10 @@ fn localized_status(english: bool, status: &str) -> String {
         _ if status.starts_with("Could not register shortcut range:") => format!(
             "快捷键范围注册失败，已保留原配置：{}",
             status.trim_start_matches("Could not register shortcut range:")
+        ),
+        _ if status.starts_with("Shortcut range partially registered:") => format!(
+            "部分快捷键因系统或其他程序占用而未启用，其余可用按键仍然有效。{}",
+            status.trim_start_matches("Shortcut range partially registered:")
         ),
         _ if status.starts_with("Some group window actions failed:") => {
             format!(
@@ -407,7 +414,11 @@ fn available_suffixes() -> Vec<(String, String)> {
         .map(|n| (format!("Digit{n}"), n.to_string()))
         .chain(('A'..='Z').map(|ch| (format!("Key{ch}"), ch.to_string())))
         .chain((1..=12).map(|n| (format!("F{n}"), format!("F{n}"))))
-        .chain([("Minus".into(), "-".into()), ("Equal".into(), "=".into())])
+        .chain([
+            ("Minus".into(), "-".into()),
+            ("Equal".into(), "=".into()),
+            ("Semicolon".into(), ";".into()),
+        ])
         .collect()
 }
 
@@ -941,6 +952,7 @@ impl VeilKeyApp {
         };
         let previous: Vec<_> = self.dynamic_hotkey_roles.values().cloned().collect();
         let mut registered: Vec<DynamicHotkeyRole> = Vec::new();
+        let mut registration_errors = Vec::new();
         for role in &planned {
             let hotkey = role.hotkey;
             if self.dynamic_hotkey_roles.contains_key(&hotkey.id)
@@ -949,14 +961,8 @@ impl VeilKeyApp {
                 continue;
             }
             if let Err(error) = manager.register(hotkey) {
-                for role in &registered {
-                    if manager.unregister(role.hotkey).is_ok() {
-                        self.registered_hotkey_ids.remove(&role.hotkey.id);
-                    }
-                }
-                self.state.status = format!("Could not register shortcut range: {error}");
-                self.hotkey_retry_needed = true;
-                return false;
+                registration_errors.push(error.to_string());
+                continue;
             }
             self.registered_hotkey_ids.insert(hotkey.id);
             registered.push(role.clone());
@@ -986,9 +992,19 @@ impl VeilKeyApp {
         }
         self.dynamic_hotkey_roles = planned
             .into_iter()
+            .filter(|role| self.registered_hotkey_ids.contains(&role.hotkey.id))
             .map(|role| (role.hotkey.id, role))
             .collect();
-        self.state.status = "Dynamic shortcut ranges registered.".into();
+        self.hotkey_retry_needed = !registration_errors.is_empty();
+        self.state.status = if registration_errors.is_empty() {
+            "Dynamic shortcut ranges registered.".into()
+        } else {
+            format!(
+                "Shortcut range partially registered: {} shortcut(s) unavailable. First error: {}",
+                registration_errors.len(),
+                registration_errors[0]
+            )
+        };
         self.persist();
         true
     }
@@ -1520,7 +1536,7 @@ impl VeilKeyApp {
         self.exit_requested.load(Ordering::Acquire)
     }
 
-    fn dynamic_ui(&mut self, ui: &mut egui::Ui, english: bool) {
+    fn dynamic_ui(&mut self, ui: &mut egui::Ui, english: bool, show_bindings: bool) {
         let mut apply = false;
         let mut reset = false;
         let mut cancel = false;
@@ -1621,6 +1637,7 @@ impl VeilKeyApp {
                     for (label, value) in [
                         ("a – z", "abcdefghijklmnopqrstuvwxyz"),
                         ("9 0 - =", "9 0 - ="),
+                        ("- = ;", "- = ;"),
                         ("0 – 9", "0 1 2 3 4 5 6 7 8 9"),
                         ("F1 – F4", "F1 F2 F3 F4"),
                     ] {
@@ -1671,7 +1688,14 @@ impl VeilKeyApp {
                 self.dynamic_range_draft.dynamic_toggle_modifiers.clone();
             self.state.dynamic_suffixes =
                 parse_suffix_input(&self.dynamic_suffix_input).unwrap_or_default();
-            if !self.register_dynamic_hotkeys() {
+            if !self.state.bind_mode.is_dynamic() {
+                self.persist();
+                self.state.status =
+                    "Shortcut range saved. Select a dynamic mode to activate it.".into();
+                self.dynamic_range_draft = self.state.clone();
+                self.dynamic_suffix_input = suffix_input(&self.state.dynamic_suffixes);
+                self.dynamic_config_error.clear();
+            } else if !self.register_dynamic_hotkeys() {
                 self.dynamic_config_error = localized_status(english, &self.state.status);
                 (
                     self.state.dynamic_toggle_modifiers,
@@ -1681,8 +1705,13 @@ impl VeilKeyApp {
                 self.dynamic_range_draft = self.state.clone();
                 self.dynamic_suffix_input = suffix_input(&self.state.dynamic_suffixes);
                 self.dynamic_config_error.clear();
-                self.state.status.clear();
+                if self.state.status == "Dynamic shortcut ranges registered." {
+                    self.state.status.clear();
+                }
             }
+        }
+        if !show_bindings {
+            return;
         }
         ui.add_space(8.0);
         ui.separator();
@@ -1884,6 +1913,7 @@ impl eframe::App for VeilKeyApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::central_panel(&ctx.style()).inner_margin(24.0))
             .show(ctx, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
             let old_mode = self.state.bind_mode;
             ui.horizontal(|ui| {
                 for (mode, en, zh) in [
@@ -1924,8 +1954,8 @@ impl eframe::App for VeilKeyApp {
                 });
                 ui.add_space(4.0);
             }
+            self.dynamic_ui(ui, english, self.state.bind_mode.is_dynamic());
             if self.state.bind_mode.is_dynamic() {
-                self.dynamic_ui(ui, english);
                 return;
             }
             ui.columns(2, |columns| {
@@ -2235,6 +2265,7 @@ impl eframe::App for VeilKeyApp {
                     }
                 }
             });
+            });
         });
     }
 }
@@ -2370,6 +2401,10 @@ mod tests {
         assert_eq!(
             parse_suffix_input("90-=").unwrap(),
             ["Digit9", "Digit0", "Minus", "Equal"]
+        );
+        assert_eq!(
+            parse_suffix_input("- = ;").unwrap(),
+            ["Minus", "Equal", "Semicolon"]
         );
         assert_eq!(
             parse_suffix_input("a B, F1 f12，0 a").unwrap(),

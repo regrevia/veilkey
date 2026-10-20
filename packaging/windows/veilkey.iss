@@ -22,6 +22,8 @@ DefaultDirName={localappdata}\Programs\VeilKey
 DefaultGroupName={#AppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
+CloseApplications=no
+RestartApplications=no
 OutputDir=.
 OutputBaseFilename=VeilKey-Setup-{#AppVersion}-windows-x64
 Compression=lzma2
@@ -47,3 +49,16 @@ Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription:
 
 [Run]
 Filename: "{app}\veilkey.exe"; Description: "Launch VeilKey"; Flags: nowait postinstall skipifsilent
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  // VeilKey stays in the notification area and deliberately ignores ordinary
+  // WM_CLOSE, so stop the old instance before replacing its executable.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM veilkey.exe', '', SW_HIDE,
+    ewWaitUntilTerminated, ResultCode);
+  Sleep(750);
+end;

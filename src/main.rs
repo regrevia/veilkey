@@ -666,6 +666,35 @@ impl VeilKeyApp {
             // untouched default so existing installs remain usable.
             state.dynamic_toggle_modifiers = vec!["ctrl".into(), "alt".into()];
         }
+        #[cfg(target_os = "windows")]
+        {
+            // An installer may have to terminate an older tray instance before
+            // replacing its executable. Restore any static groups that were
+            // hidden by that instance so an interrupted shutdown cannot leave
+            // target windows stranded behind an invisible VeilKey process.
+            let startup_hidden: Vec<Group> = state
+                .groups
+                .iter()
+                .filter(|group| !group.is_visible && !group.window_ids.is_empty())
+                .cloned()
+                .collect();
+            if !startup_hidden.is_empty()
+                && let Ok(windows) = NativeWindowController::enumerate_fast()
+            {
+                let actions: Vec<_> = startup_hidden
+                    .iter()
+                    .flat_map(|group| restore_group_actions(group, &windows))
+                    .collect();
+                if !actions.is_empty() && NativeWindowController::apply_actions(actions).is_ok() {
+                    for group in &mut state.groups {
+                        if !group.is_visible {
+                            group.is_visible = true;
+                        }
+                    }
+                    let _ = save_state(&state_file, &state);
+                }
+            }
+        }
         let mut dynamic_recovery: Vec<Group> = std::mem::take(&mut state.dynamic_groups)
             .into_values()
             .filter(|group| !group.is_visible)

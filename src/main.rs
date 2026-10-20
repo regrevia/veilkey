@@ -83,6 +83,7 @@ fn localized_status(english: bool, status: &str) -> String {
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 fn create_tray(
     ctx: &egui::Context,
+    exit_requested: Arc<AtomicBool>,
 ) -> Result<(tray_icon::TrayIcon, Receiver<TrayCommand>, Arc<AtomicBool>), String> {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
@@ -118,6 +119,7 @@ fn create_tray(
     let (sender, receiver) = mpsc::channel();
     let menu_sender = sender.clone();
     let menu_ctx = ctx.clone();
+    let menu_exit_requested = Arc::clone(&exit_requested);
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         let command = match event.id().as_ref() {
             SHOW_ID => Some(TrayCommand::Show),
@@ -125,6 +127,14 @@ fn create_tray(
             _ => None,
         };
         if let Some(command) = command {
+            if matches!(command, TrayCommand::Exit) {
+                // Set this directly from the tray callback. A hidden viewport
+                // may not immediately consume the command channel.
+                menu_exit_requested.store(true, Ordering::Release);
+            } else if matches!(command, TrayCommand::Show) {
+                menu_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                menu_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
             let _ = menu_sender.send(command);
             menu_ctx.request_repaint();
         }
@@ -146,7 +156,7 @@ fn create_tray(
             tray_ctx.request_repaint();
         }
     }));
-    Ok((tray, receiver, Arc::new(AtomicBool::new(false))))
+    Ok((tray, receiver, exit_requested))
 }
 
 fn capture_retry_delay(failures: u32) -> Duration {
@@ -664,7 +674,9 @@ impl VeilKeyApp {
             dynamic_recovery.clear();
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let (tray_icon, tray_events, exit_requested) = match create_tray(ctx) {
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let (tray_icon, tray_events, exit_requested) = match create_tray(ctx, exit_requested) {
             Ok(tray) => (Some(tray.0), tray.1, tray.2),
             Err(error) => {
                 eprintln!("Could not create VeilKey notification-area icon: {error}");
@@ -1711,6 +1723,9 @@ impl VeilKeyApp {
             }
         }
         if self.on_exit_requested() && self.exit_cleanup_completed {
+            // Remove the notification icon before asking winit to destroy the
+            // hidden viewport, so Windows does not retain a stale tray entry.
+            self.tray_icon.take();
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }

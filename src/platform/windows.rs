@@ -143,10 +143,18 @@ impl NativeWindowController {
     }
 
     pub fn focused_window_snapshot(
-        _additional_window_ids: &[String],
+        logically_hidden_window_ids: &[String],
     ) -> Result<(Option<String>, Vec<WindowInfo>), String> {
         let foreground = unsafe { GetForegroundWindow() };
-        let windows = Self::enumerate_fast()?;
+        let mut windows = Self::enumerate_fast()?;
+        for window in &mut windows {
+            if logically_hidden_window_ids
+                .iter()
+                .any(|id| crate::same_window_id(&window.id, id))
+            {
+                window.visible = false;
+            }
+        }
         let focused = (!foreground.0.is_null())
             .then(|| {
                 windows

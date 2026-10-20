@@ -358,6 +358,7 @@ struct VeilKeyApp {
     dynamic_suffix_input: String,
     dynamic_config_error: String,
     dynamic_recovery: Vec<Group>,
+    self_hidden_window_ids: HashSet<String>,
     action_tx: mpsc::SyncSender<WindowActionRequest>,
     action_rx: Receiver<ActionCompletion>,
     action_in_flight: bool,
@@ -397,7 +398,7 @@ type DynamicToggleLookup = (
     Result<Option<String>, String>,
     Result<Vec<WindowInfo>, String>,
 );
-type DynamicToggleRequest = (BindMode, String, Vec<String>);
+type DynamicToggleRequest = (BindMode, String, Vec<String>, Vec<String>);
 
 #[derive(Clone)]
 struct DynamicHotkeyRole {
@@ -471,6 +472,25 @@ fn readable_chord(chord: &str, macos: bool) -> String {
 
 fn is_bound_in_session(group: &Group) -> bool {
     !group.window_ids.is_empty()
+}
+
+fn is_own_window_id(window_id: &str) -> bool {
+    window_id
+        .split('|')
+        .find_map(|part| part.strip_prefix("pid:"))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        == Some(std::process::id())
+}
+
+fn preserve_logically_hidden_windows(windows: &mut [WindowInfo], hidden_ids: &HashSet<String>) {
+    for window in windows {
+        if hidden_ids
+            .iter()
+            .any(|id| veilkey::same_window_id(&window.id, id))
+        {
+            window.visible = false;
+        }
+    }
 }
 
 fn available_suffixes() -> Vec<(String, String)> {
@@ -684,6 +704,11 @@ enum TrayCommand {
 
 impl VeilKeyApp {
     fn new(instance_lock: File, ctx: &egui::Context) -> Self {
+        #[cfg(target_os = "windows")]
+        veilkey::platform::debug_log(format!(
+            "application started diagnostic=windows-self-window-wake-2 pid={}",
+            std::process::id()
+        ));
         let state_file = state_path();
         let mut state = load_state(&state_file);
         #[cfg(target_os = "windows")]
@@ -835,12 +860,15 @@ impl VeilKeyApp {
         let (dynamic_toggle_results, dynamic_toggle_rx) = mpsc::channel();
         let dynamic_toggle_ctx = ctx.clone();
         thread::spawn(move || {
-            while let Ok((mode, suffix, previous_window_ids)) = dynamic_toggle_requests.recv() {
-                let (focused, windows) =
-                    match NativeWindowController::focused_window_snapshot(&previous_window_ids) {
-                        Ok((focused, windows)) => (Ok(focused), Ok(windows)),
-                        Err(error) => (Err(error.clone()), Err(error)),
-                    };
+            while let Ok((mode, suffix, _previous_window_ids, self_hidden_window_ids)) =
+                dynamic_toggle_requests.recv()
+            {
+                let (focused, windows) = match NativeWindowController::focused_window_snapshot(
+                    &self_hidden_window_ids,
+                ) {
+                    Ok((focused, windows)) => (Ok(focused), Ok(windows)),
+                    Err(error) => (Err(error.clone()), Err(error)),
+                };
                 if dynamic_toggle_results
                     .send((mode, suffix, focused, windows))
                     .is_err()
@@ -1014,6 +1042,7 @@ impl VeilKeyApp {
             dynamic_suffix_input,
             dynamic_config_error: String::new(),
             dynamic_recovery,
+            self_hidden_window_ids: HashSet::new(),
             action_tx,
             action_rx,
             action_in_flight: false,
@@ -1234,6 +1263,19 @@ impl VeilKeyApp {
     fn apply_actions(&mut self, actions: Vec<WindowAction>) {
         if actions.is_empty() {
             return;
+        }
+        for action in &actions {
+            if let WindowAction::SetVisible {
+                window_id, visible, ..
+            } = action
+                && is_own_window_id(window_id)
+            {
+                if *visible {
+                    self.self_hidden_window_ids.remove(window_id);
+                } else {
+                    self.self_hidden_window_ids.insert(window_id.clone());
+                }
+            }
         }
         #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!("queue window actions count={}", actions.len()));
@@ -1498,7 +1540,16 @@ impl VeilKeyApp {
             let focused_id = focused.as_ref().ok().and_then(|value| value.as_deref());
             let fullscreen_foreground = focused_id
                 .is_some_and(|id| veilkey::platform::is_fullscreen_window(id, &self.windows));
+            let slot_contains_hidden_own_window =
+                self.state.dynamic_groups.get(&suffix).is_some_and(|group| {
+                    group.window_ids.iter().any(|id| {
+                        self.self_hidden_window_ids
+                            .iter()
+                            .any(|hidden| veilkey::same_window_id(id, hidden))
+                    })
+                });
             let binding = !fullscreen_foreground
+                && !slot_contains_hidden_own_window
                 && should_bind_slot(
                     self.state.dynamic_groups.get(&suffix),
                     focused_id,
@@ -1605,10 +1656,12 @@ impl VeilKeyApp {
             .get(&role.suffix)
             .map(|group| group.window_ids.iter().cloned().collect())
             .unwrap_or_default();
+        let self_hidden_window_ids = self.self_hidden_window_ids.iter().cloned().collect();
         match self.dynamic_toggle_tx.try_send((
             self.state.bind_mode,
             role.suffix,
             previous_window_ids,
+            self_hidden_window_ids,
         )) {
             Ok(()) => self.dynamic_toggle_in_flight = true,
             Err(mpsc::TrySendError::Full(_)) => {
@@ -1771,6 +1824,13 @@ impl VeilKeyApp {
             match result {
                 Ok(windows) => {
                     self.windows = windows;
+                    // Waking VeilKey's native HWND is necessary to restart
+                    // eframe's event loop. Retain its logical hidden state until
+                    // the self-window shortcut explicitly shows it.
+                    preserve_logically_hidden_windows(
+                        &mut self.windows,
+                        &self.self_hidden_window_ids,
+                    );
                 }
                 Err(error) => self.state.status = error,
             }
@@ -2756,6 +2816,34 @@ fn configure_windows_cjk_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_wake_does_not_change_the_logical_visibility_of_a_hidden_self_window() {
+        let id = format!(
+            "veilkey.exe\0VeilKey\00|hwnd:1234|pid:{}",
+            std::process::id()
+        );
+        let mut windows = vec![WindowInfo {
+            id: id.clone(),
+            title: "VeilKey".into(),
+            app: "veilkey.exe".into(),
+            rect: veilkey::Rect {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+            visible: true,
+            native_handle: 0x1234,
+            process_id: std::process::id(),
+            preview: None,
+        }];
+        let hidden = HashSet::from([id]);
+
+        preserve_logically_hidden_windows(&mut windows, &hidden);
+
+        assert!(!windows[0].visible);
+    }
 
     #[test]
     fn suffix_form_accepts_compact_reference_format_and_function_keys() {

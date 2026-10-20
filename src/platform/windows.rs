@@ -29,6 +29,38 @@ struct RawWindow {
 pub struct NativeWindowController;
 
 impl NativeWindowController {
+    pub fn is_fullscreen_window(window_id: &str, windows: &[WindowInfo]) -> bool {
+        let Some(window) = windows
+            .iter()
+            .find(|window| crate::same_window_id(&window.id, window_id))
+        else {
+            return false;
+        };
+        let hwnd = HWND(window.native_handle as *mut core::ffi::c_void);
+        unsafe {
+            if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                return false;
+            }
+            let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut info = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+                return false;
+            }
+            let mut rect = RECT::default();
+            if GetWindowRect(hwnd, &mut rect).is_err() {
+                return false;
+            }
+            let monitor = info.rcMonitor;
+            (rect.left - monitor.left).abs() <= 2
+                && (rect.top - monitor.top).abs() <= 2
+                && (rect.right - monitor.right).abs() <= 2
+                && (rect.bottom - monitor.bottom).abs() <= 2
+        }
+    }
+
     pub fn focused_window_snapshot(
         _additional_window_ids: &[String],
     ) -> Result<(Option<String>, Vec<WindowInfo>), String> {

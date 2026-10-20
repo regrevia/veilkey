@@ -7,6 +7,16 @@ pub use macos::NativeWindowController;
 #[cfg(target_os = "windows")]
 pub use windows::NativeWindowController;
 
+#[cfg(target_os = "windows")]
+pub fn is_fullscreen_window(window_id: &str, windows: &[crate::WindowInfo]) -> bool {
+    windows::NativeWindowController::is_fullscreen_window(window_id, windows)
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_fullscreen_window(_window_id: &str, _windows: &[crate::WindowInfo]) -> bool {
+    false
+}
+
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
 pub struct NativeWindowController;
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]

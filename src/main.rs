@@ -548,22 +548,29 @@ fn should_bind_slot(group: Option<&Group>, focused: Option<&str>, windows: &[Win
     }) {
         return false;
     }
-    // Hiding transfers focus elsewhere. The next press must restore this slot,
-    // rather than accidentally capturing whichever application received focus.
-    if !group.is_visible
-        || group.window_ids.iter().any(|id| {
-            windows
-                .iter()
-                .any(|window| veilkey::same_window_id(&window.id, id) && !window.visible)
-        })
+    // Desktop focus (or focus owned by VeilKey itself) means the shortcut is
+    // being used to toggle the saved target. A real, different foreground app
+    // means the user is switching targets: restore the old target and bind the
+    // newly focused one, even if the old target is currently hidden.
+    if focused.is_none() {
+        return false;
+    }
+    let Some(focused) = focused else {
+        return false;
+    };
+    if group
+        .window_ids
+        .iter()
+        .any(|saved| veilkey::same_window_id(focused, saved))
     {
         return false;
     }
-    focused.is_some_and(|focused| {
-        !group
-            .window_ids
-            .iter()
-            .any(|saved| veilkey::same_window_id(focused, saved))
+    // If enumeration cannot identify the foreground window, only a concrete
+    // different application window is eligible for rebinding.
+    windows.iter().any(|window| {
+        veilkey::same_window_id(&window.id, focused)
+            && window.process_id != std::process::id()
+            && (group.is_visible || window.visible)
     })
 }
 
@@ -1340,11 +1347,15 @@ impl VeilKeyApp {
             };
             self.windows = windows;
             let mut actions = Vec::new();
-            let binding = should_bind_slot(
-                self.state.dynamic_groups.get(&suffix),
-                focused.as_ref().ok().and_then(|value| value.as_deref()),
-                &self.windows,
-            );
+            let focused_id = focused.as_ref().ok().and_then(|value| value.as_deref());
+            let fullscreen_foreground = focused_id
+                .is_some_and(|id| veilkey::platform::is_fullscreen_window(id, &self.windows));
+            let binding = !fullscreen_foreground
+                && should_bind_slot(
+                    self.state.dynamic_groups.get(&suffix),
+                    focused_id,
+                    &self.windows,
+                );
             if binding {
                 let focused = match focused {
                     Ok(Some(id)) => id,
@@ -2807,7 +2818,23 @@ mod tests {
             process_id: 10,
             preview: None,
         }];
-        assert!(!should_bind_slot(Some(&first), Some("other-app"), &windows));
+        let other_app = [WindowInfo {
+            id: "other-app".into(),
+            title: "Other".into(),
+            app: "Other".into(),
+            rect: Default::default(),
+            visible: true,
+            native_handle: 43,
+            process_id: 11,
+            preview: None,
+        }];
+        assert!(should_bind_slot(
+            Some(&first),
+            Some("other-app"),
+            &[windows.first().unwrap().clone(), other_app[0].clone()]
+        ));
+        // Desktop focus has no enumerated HWND, so it toggles the saved slot.
+        assert!(!should_bind_slot(Some(&first), None, &windows));
         let actions = slot_actions(&mut first, &windows);
         assert!(matches!(
             actions.as_slice(),
@@ -2818,10 +2845,13 @@ mod tests {
             }]
         ));
         assert!(first.is_visible);
-        let visible_windows = [WindowInfo {
-            visible: true,
-            ..windows[0].clone()
-        }];
+        let visible_windows = [
+            WindowInfo {
+                visible: true,
+                ..windows[0].clone()
+            },
+            other_app[0].clone(),
+        ];
         assert!(!should_bind_slot(
             Some(&first),
             Some("first"),
@@ -2856,6 +2886,49 @@ mod tests {
                 handle: 1,
                 ..
             }]
+        ));
+    }
+
+    #[test]
+    fn switching_from_hidden_slot_restores_old_and_hides_new_target() {
+        let mut old = group("Old target", "super+Digit9");
+        old.window_ids.insert("old".into());
+        old.is_visible = false;
+        let new = WindowInfo {
+            id: "new".into(),
+            title: "New target".into(),
+            app: "Example".into(),
+            rect: Default::default(),
+            visible: true,
+            native_handle: 2,
+            process_id: 11,
+            preview: None,
+        };
+        let windows = [
+            WindowInfo {
+                id: "old".into(),
+                title: "Old target".into(),
+                app: "Example".into(),
+                rect: Default::default(),
+                visible: false,
+                native_handle: 1,
+                process_id: 10,
+                preview: None,
+            },
+            new.clone(),
+        ];
+
+        assert!(should_bind_slot(Some(&old), Some("new"), &windows));
+        let mut actions = restore_group_actions(&old, &windows);
+        let mut replacement = group("New target", "super+Digit9");
+        replacement.window_ids.insert("new".into());
+        actions.extend(slot_actions(&mut replacement, &windows));
+        assert!(matches!(
+            actions.as_slice(),
+            [
+                WindowAction::SetVisible { window_id: old_id, visible: true, .. },
+                WindowAction::SetVisible { window_id: new_id, visible: false, .. }
+            ] if old_id == "old" && new_id == "new"
         ));
     }
 

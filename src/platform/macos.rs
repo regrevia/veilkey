@@ -316,8 +316,21 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
         WindowAction::SetVisible {
             visible,
             hide_application: false,
+            restore_rect,
             ..
         } => {
+            if visible && let Some(rect) = restore_rect {
+                // Keep the shared action's restore geometry effective on macOS;
+                // Windows combines this with showing the window in one native call.
+                apply_to_window(
+                    window,
+                    WindowAction::SetRect {
+                        window_id: String::new(),
+                        handle: 0,
+                        rect,
+                    },
+                )?;
+            }
             let attribute = cf_string(kAXMinimizedAttribute)?;
             let value = unsafe {
                 if visible {

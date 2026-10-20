@@ -237,6 +237,7 @@ pub enum WindowAction {
         visible: bool,
         force_popup: bool,
         hide_application: bool,
+        restore_rect: Option<Rect>,
     },
     SetRect {
         window_id: String,
@@ -308,6 +309,7 @@ impl AppState {
                         visible: false,
                         force_popup: group.force_popup,
                         hide_application: group.macos_hide_application,
+                        restore_rect: None,
                     });
                 }
             }
@@ -315,21 +317,17 @@ impl AppState {
         } else {
             for id in &group.window_ids {
                 if let Some(window) = find_window(id).filter(|window| !window.visible) {
-                    if !group.macos_hide_application
-                        && let Some(rect) = group.restore_rects.get(id)
-                    {
-                        actions.push(WindowAction::SetRect {
-                            window_id: id.clone(),
-                            handle: window.native_handle,
-                            rect: *rect,
-                        });
-                    }
                     actions.push(WindowAction::SetVisible {
                         window_id: id.clone(),
                         handle: window.native_handle,
                         visible: true,
                         force_popup: group.force_popup,
                         hide_application: group.macos_hide_application,
+                        restore_rect: if group.macos_hide_application {
+                            None
+                        } else {
+                            group.restore_rects.get(id).copied()
+                        },
                     });
                 }
             }
@@ -543,14 +541,16 @@ mod tests {
                     handle: 1,
                     visible: false,
                     force_popup: false,
-                    hide_application: false
+                    hide_application: false,
+                    restore_rect: None
                 },
                 WindowAction::SetVisible {
                     window_id: "b".into(),
                     handle: 2,
                     visible: false,
                     force_popup: false,
-                    hide_application: false
+                    hide_application: false,
+                    restore_rect: None
                 },
             ]
         );
@@ -567,39 +567,31 @@ mod tests {
         assert_eq!(
             state.toggle_group(0, &hidden),
             vec![
-                WindowAction::SetRect {
+                WindowAction::SetVisible {
                     window_id: "a".into(),
                     handle: 1,
-                    rect: Rect {
+                    visible: true,
+                    force_popup: false,
+                    hide_application: false,
+                    restore_rect: Some(Rect {
                         x: 10,
                         y: 20,
                         width: 800,
                         height: 600
-                    }
+                    })
                 },
                 WindowAction::SetVisible {
-                    window_id: "a".into(),
-                    handle: 1,
-                    visible: true,
-                    force_popup: false,
-                    hide_application: false
-                },
-                WindowAction::SetRect {
                     window_id: "b".into(),
                     handle: 2,
-                    rect: Rect {
+                    visible: true,
+                    force_popup: false,
+                    hide_application: false,
+                    restore_rect: Some(Rect {
                         x: 900,
                         y: 20,
                         width: 800,
                         height: 600
-                    }
-                },
-                WindowAction::SetVisible {
-                    window_id: "b".into(),
-                    handle: 2,
-                    visible: true,
-                    force_popup: false,
-                    hide_application: false
+                    })
                 },
             ]
         );
@@ -635,8 +627,11 @@ mod tests {
         let restored_rects: BTreeMap<_, _> = restore_actions
             .into_iter()
             .filter_map(|action| match action {
-                WindowAction::SetRect {
-                    window_id, rect, ..
+                WindowAction::SetVisible {
+                    window_id,
+                    visible: true,
+                    restore_rect: Some(rect),
+                    ..
                 } => Some((window_id, rect)),
                 _ => None,
             })
@@ -663,16 +658,11 @@ mod tests {
             sample_window("b", 2, 1200),
         ];
         let actions = state.toggle_group(0, &mixed);
-        assert_eq!(actions.len(), 2);
+        assert_eq!(actions.len(), 1);
         assert!(matches!(
             actions[0],
-            WindowAction::SetRect { ref window_id, rect, .. }
+            WindowAction::SetVisible { ref window_id, visible: true, restore_rect: Some(rect), .. }
                 if window_id == "a" && rect.x == 10
-        ));
-        assert!(matches!(
-            actions[1],
-            WindowAction::SetVisible { ref window_id, visible: true, .. }
-                if window_id == "a"
         ));
         assert!(state.groups[0].is_visible);
     }

@@ -12,9 +12,10 @@ use windows::Win32::System::Threading::{
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement,
     GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
-    HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE,
-    SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
-    SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    HWND_TOP, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
+    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
+    WS_EX_TOOLWINDOW,
 };
 
 #[derive(Clone)]
@@ -200,22 +201,40 @@ impl NativeWindowController {
                 } => (window_id.as_str(), *handle),
             };
             let hwnd = HWND(handle as *mut core::ffi::c_void);
-            if !window_handle_matches_identity(hwnd, window_id) {
+            let Some(window_title) = validated_window_title(hwnd, window_id) else {
                 errors.push(format!(
                     "Window '{window_id}' disappeared or changed identity; refresh and rebind it."
                 ));
                 continue;
-            }
-            let window_title = window_title(hwnd).unwrap_or_else(|| window_id.to_owned());
+            };
             let result = match action {
                 WindowAction::SetVisible {
                     visible,
                     force_popup,
+                    restore_rect,
                     ..
                 } => unsafe {
                     if visible {
-                        if force_popup {
-                            // Place above normal windows without activating or changing display mode.
+                        if let Some(rect) = restore_rect {
+                            let rect = rect_to_native(rect);
+                            let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER;
+                            let flags = if force_popup {
+                                flags
+                            } else {
+                                flags | SWP_NOZORDER
+                            };
+                            SetWindowPos(
+                                hwnd,
+                                if force_popup { HWND_TOPMOST } else { HWND_TOP },
+                                rect.left,
+                                rect.top,
+                                rect.right - rect.left,
+                                rect.bottom - rect.top,
+                                flags,
+                            )
+                            .map_err(|e| e.to_string())
+                            .and_then(|()| verify_window_still_exists(hwnd))
+                        } else if force_popup {
                             SetWindowPos(
                                 hwnd,
                                 HWND_TOPMOST,
@@ -337,19 +356,19 @@ fn expected_process_id(window_id: &str) -> Option<u32> {
         .ok()
 }
 
-fn window_handle_matches_identity(hwnd: HWND, window_id: &str) -> bool {
-    let Some(expected_pid) = expected_process_id(window_id) else {
-        return false;
-    };
+fn validated_window_title(hwnd: HWND, window_id: &str) -> Option<String> {
+    let expected_pid = expected_process_id(window_id)?;
     unsafe {
         if !IsWindow(hwnd).as_bool() {
-            return false;
+            return None;
         }
         let mut actual_pid = 0u32;
         GetWindowThreadProcessId(hwnd, Some(&mut actual_pid));
-        actual_pid != 0
-            && actual_pid == expected_pid
-            && window_title(hwnd).as_deref() == window_id.split('\0').nth(1)
+        if actual_pid == 0 || actual_pid != expected_pid {
+            return None;
+        }
+        let title = window_title(hwnd)?;
+        (Some(title.as_str()) == window_id.split('\0').nth(1)).then_some(title)
     }
 }
 

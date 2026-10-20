@@ -303,8 +303,9 @@ struct VeilKeyApp {
     focused_binding_in_flight: bool,
     pending_bind_group: Option<String>,
     dynamic_toggle_rx: Receiver<DynamicToggleLookup>,
-    dynamic_toggle_tx: mpsc::Sender<DynamicToggleLookup>,
+    dynamic_toggle_tx: mpsc::SyncSender<DynamicToggleRequest>,
     dynamic_toggle_in_flight: bool,
+    pending_dynamic_toggles: VecDeque<DynamicHotkeyRole>,
     dynamic_hotkey_roles: HashMap<u32, DynamicHotkeyRole>,
     dynamic_range_draft: AppState,
     dynamic_suffix_input: String,
@@ -336,6 +337,7 @@ type DynamicToggleLookup = (
     Result<Option<String>, String>,
     Result<Vec<WindowInfo>, String>,
 );
+type DynamicToggleRequest = (BindMode, String, Vec<String>);
 
 #[derive(Clone)]
 struct DynamicHotkeyRole {
@@ -560,21 +562,17 @@ fn restore_group_actions(group: &Group, windows: &[WindowInfo]) -> Vec<WindowAct
             .iter()
             .find(|window| veilkey::same_window_id(&window.id, id) && !window.visible)
         {
-            if !group.macos_hide_application
-                && let Some(rect) = group.restore_rects.get(id)
-            {
-                actions.push(WindowAction::SetRect {
-                    window_id: id.clone(),
-                    handle: window.native_handle,
-                    rect: *rect,
-                });
-            }
             actions.push(WindowAction::SetVisible {
                 window_id: id.clone(),
                 handle: window.native_handle,
                 visible: true,
                 force_popup: group.force_popup,
                 hide_application: group.macos_hide_application,
+                restore_rect: if group.macos_hide_application {
+                    None
+                } else {
+                    group.restore_rects.get(id).copied()
+                },
             });
         }
     }
@@ -710,7 +708,24 @@ impl VeilKeyApp {
         let listener_alive = Arc::clone(&capture_listener_alive);
         let (capture_tx, capture_rx) = mpsc::sync_channel(32);
         let (focused_binding_tx, focused_binding_rx) = mpsc::channel();
-        let (dynamic_toggle_tx, dynamic_toggle_rx) = mpsc::channel();
+        let (dynamic_toggle_tx, dynamic_toggle_requests) =
+            mpsc::sync_channel::<DynamicToggleRequest>(16);
+        let (dynamic_toggle_results, dynamic_toggle_rx) = mpsc::channel();
+        thread::spawn(move || {
+            while let Ok((mode, suffix, previous_window_ids)) = dynamic_toggle_requests.recv() {
+                let (focused, windows) =
+                    match NativeWindowController::focused_window_snapshot(&previous_window_ids) {
+                        Ok((focused, windows)) => (Ok(focused), Ok(windows)),
+                        Err(error) => (Err(error.clone()), Err(error)),
+                    };
+                if dynamic_toggle_results
+                    .send((mode, suffix, focused, windows))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         thread::spawn(move || {
             let mut failures = 0_u32;
             loop {
@@ -806,6 +821,7 @@ impl VeilKeyApp {
             dynamic_toggle_rx,
             dynamic_toggle_tx,
             dynamic_toggle_in_flight: false,
+            pending_dynamic_toggles: VecDeque::new(),
             dynamic_hotkey_roles: HashMap::new(),
             dynamic_range_draft,
             dynamic_suffix_input,
@@ -1347,26 +1363,45 @@ impl VeilKeyApp {
 
     fn activate_dynamic_hotkey(&mut self, role: DynamicHotkeyRole) {
         if self.dynamic_toggle_in_flight || self.action_in_flight {
-            self.state.status = "A window operation is already in progress.".into();
+            if self.pending_dynamic_toggles.len() < 16 {
+                self.pending_dynamic_toggles.push_back(role);
+            } else {
+                self.state.status = "Too many window shortcuts are queued.".into();
+            }
             return;
         }
-        self.dynamic_toggle_in_flight = true;
-        let mode = self.state.bind_mode;
+        self.start_dynamic_hotkey_lookup(role);
+    }
+
+    fn start_dynamic_hotkey_lookup(&mut self, role: DynamicHotkeyRole) {
         let previous_window_ids: Vec<String> = self
             .state
             .dynamic_groups
             .get(&role.suffix)
             .map(|group| group.window_ids.iter().cloned().collect())
             .unwrap_or_default();
-        let sender = self.dynamic_toggle_tx.clone();
-        thread::spawn(move || {
-            let (focused, windows) =
-                match NativeWindowController::focused_window_snapshot(&previous_window_ids) {
-                    Ok((focused, windows)) => (Ok(focused), Ok(windows)),
-                    Err(error) => (Err(error.clone()), Err(error)),
-                };
-            let _ = sender.send((mode, role.suffix, focused, windows));
-        });
+        match self.dynamic_toggle_tx.try_send((
+            self.state.bind_mode,
+            role.suffix,
+            previous_window_ids,
+        )) {
+            Ok(()) => self.dynamic_toggle_in_flight = true,
+            Err(mpsc::TrySendError::Full(_)) => {
+                self.state.status = "Window lookup queue is busy; shortcut was not applied.".into();
+            }
+            Err(mpsc::TrySendError::Disconnected(_)) => {
+                self.state.status = "Window lookup worker stopped.".into();
+            }
+        }
+    }
+
+    fn start_next_dynamic_toggle(&mut self) {
+        if self.dynamic_toggle_in_flight || self.action_in_flight {
+            return;
+        }
+        if let Some(role) = self.pending_dynamic_toggles.pop_front() {
+            self.start_dynamic_hotkey_lookup(role);
+        }
     }
 
     fn capture_hotkey(&mut self, ctx: &egui::Context) {
@@ -1886,8 +1921,14 @@ impl eframe::App for VeilKeyApp {
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
         self.process_dynamic_toggle_results(self.state.english_ui);
+        self.start_next_dynamic_toggle();
         self.sync_preview_textures(ctx);
-        ctx.request_repaint_after(Duration::from_millis(100));
+        // GlobalHotKey exposes a receiver instead of a UI wake callback. Poll it
+        // frequently on Windows so shortcut latency stays below a display frame.
+        #[cfg(target_os = "windows")]
+        ctx.request_repaint_after(Duration::from_millis(8));
+        #[cfg(not(target_os = "windows"))]
+        ctx.request_repaint_after(Duration::from_millis(32));
         let english = self.state.english_ui;
         let displayable_count = self
             .windows

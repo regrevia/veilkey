@@ -100,9 +100,6 @@ impl NativeWindowController {
                 }
                 let mut pid = 0u32;
                 GetWindowThreadProcessId(hwnd, Some(&mut pid));
-                if pid == std::process::id() {
-                    return BOOL(1);
-                }
                 let app = process_name(pid);
                 raw.push(RawWindow {
                     hwnd,

@@ -1298,11 +1298,13 @@ impl VeilKeyApp {
                     self.state.status = "无法识别当前窗口目标。".into();
                     continue;
                 };
-                if ids.iter().any(|id| {
-                    self.windows
-                        .iter()
-                        .any(|w| &w.id == id && w.process_id == std::process::id())
-                }) {
+                if !cfg!(target_os = "windows")
+                    && ids.iter().any(|id| {
+                        self.windows
+                            .iter()
+                            .any(|w| &w.id == id && w.process_id == std::process::id())
+                    })
+                {
                     self.state.status = "请切换到目标应用后再绑定。".into();
                     continue;
                 }

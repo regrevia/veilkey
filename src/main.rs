@@ -2338,11 +2338,11 @@ fn configure_windows_cjk_fonts(ctx: &egui::Context) {
         std::sync::Arc::new(egui::FontData::from_owned(bytes)),
     );
     for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-        fonts
-            .families
-            .entry(family)
-            .or_default()
-            .push("windows_cjk".into());
+        // Make sure Windows' CJK font is tried before egui's Latin-only default
+        // fonts. Keeping the defaults after it still provides glyph fallback
+        // for symbols that are not present in the selected system font.
+        let family_fonts = fonts.families.entry(family).or_default();
+        family_fonts.insert(0, "windows_cjk".into());
     }
     eprintln!("Using Windows Chinese font: {}", path.display());
     ctx.set_fonts(fonts);

@@ -312,9 +312,13 @@ struct VeilKeyApp {
     dynamic_suffix_input: String,
     dynamic_config_error: String,
     dynamic_recovery: Vec<Group>,
-    action_tx: mpsc::SyncSender<Vec<WindowAction>>,
+    action_tx: mpsc::SyncSender<WindowActionRequest>,
     action_rx: Receiver<ActionCompletion>,
     action_in_flight: bool,
+    exit_cleanup_tx: mpsc::Sender<Result<(), String>>,
+    exit_cleanup_rx: Receiver<Result<(), String>>,
+    exit_cleanup_started: bool,
+    exit_cleanup_completed: bool,
     queued_toggles: VecDeque<String>,
     preview_textures: HashMap<String, egui::TextureHandle>,
     preview_pixels: HashMap<String, veilkey::WindowPreview>,
@@ -327,6 +331,13 @@ struct VeilKeyApp {
 }
 
 type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
+enum WindowActionRequest {
+    Apply(Vec<WindowAction>),
+    RestoreAndExit {
+        groups: Vec<Group>,
+        completed: mpsc::Sender<Result<(), String>>,
+    },
+}
 type FocusedBindingLookup = (
     String,
     Result<Option<String>, String>,
@@ -580,15 +591,19 @@ fn restore_group_actions(group: &Group, windows: &[WindowInfo]) -> Vec<WindowAct
     actions
 }
 
-fn restore_session_groups<'a>(
-    groups: impl Iterator<Item = &'a mut Group>,
-    windows: &[WindowInfo],
-) -> Vec<WindowAction> {
+fn restore_all_bound_windows(groups: &[Group], windows: &[WindowInfo]) -> Vec<WindowAction> {
     let mut actions = Vec::new();
+    let mut restored_handles = HashSet::new();
     for group in groups {
-        if !group.is_visible {
-            actions.extend(restore_group_actions(group, windows));
-            group.is_visible = true;
+        for action in restore_group_actions(group, windows) {
+            let handle = match &action {
+                WindowAction::SetVisible { handle, .. } | WindowAction::SetRect { handle, .. } => {
+                    *handle
+                }
+            };
+            if restored_handles.insert(handle) {
+                actions.push(action);
+            }
         }
     }
     actions
@@ -679,27 +694,45 @@ impl VeilKeyApp {
                 }
             }
         });
-        let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
+        let (action_tx, action_requests) = mpsc::sync_channel::<WindowActionRequest>(1);
         let (action_results, action_rx) = mpsc::channel();
+        let (exit_cleanup_tx, exit_cleanup_rx) = mpsc::channel();
         let action_refresh_tx = refresh_tx.clone();
         let action_ctx = ctx.clone();
         thread::spawn(move || {
-            while let Ok(actions) = action_requests.recv() {
-                #[cfg(target_os = "windows")]
-                let applied = NativeWindowController::apply_actions(actions);
-                #[cfg(not(target_os = "windows"))]
-                let applied = {
-                    let retry = actions.clone();
-                    match NativeWindowController::apply_actions(actions) {
-                        Ok(()) => Ok(()),
-                        Err(first) => match NativeWindowController::apply_actions(retry) {
-                            Ok(()) => Ok(()),
-                            Err(second) => Err(format!("{first}; retry failed: {second}")),
-                        },
+            while let Ok(request) = action_requests.recv() {
+                match request {
+                    WindowActionRequest::Apply(actions) => {
+                        #[cfg(target_os = "windows")]
+                        let applied = NativeWindowController::apply_actions(actions);
+                        #[cfg(not(target_os = "windows"))]
+                        let applied = {
+                            let retry = actions.clone();
+                            match NativeWindowController::apply_actions(actions) {
+                                Ok(()) => Ok(()),
+                                Err(first) => match NativeWindowController::apply_actions(retry) {
+                                    Ok(()) => Ok(()),
+                                    Err(second) => Err(format!("{first}; retry failed: {second}")),
+                                },
+                            }
+                        };
+                        if action_results.send((applied, Ok(Vec::new()))).is_err() {
+                            break;
+                        }
                     }
-                };
-                if action_results.send((applied, Ok(Vec::new()))).is_err() {
-                    break;
+                    WindowActionRequest::RestoreAndExit { groups, completed } => {
+                        let result = NativeWindowController::enumerate_fast().and_then(|windows| {
+                            NativeWindowController::apply_actions(restore_all_bound_windows(
+                                &groups, &windows,
+                            ))
+                        });
+                        let _ = completed.send(result.clone());
+                        if result.is_err() {
+                            eprintln!(
+                                "Could not restore every bound window while exiting: {result:?}"
+                            );
+                        }
+                    }
                 }
                 let _ = action_refresh_tx.try_send(false);
                 action_ctx.request_repaint();
@@ -851,6 +884,10 @@ impl VeilKeyApp {
             action_tx,
             action_rx,
             action_in_flight: false,
+            exit_cleanup_tx,
+            exit_cleanup_rx,
+            exit_cleanup_started: false,
+            exit_cleanup_completed: false,
             queued_toggles: VecDeque::new(),
             preview_textures: HashMap::new(),
             preview_pixels: HashMap::new(),
@@ -1057,7 +1094,7 @@ impl VeilKeyApp {
         if actions.is_empty() {
             return;
         }
-        match self.action_tx.try_send(actions) {
+        match self.action_tx.try_send(WindowActionRequest::Apply(actions)) {
             Ok(()) => self.action_in_flight = true,
             Err(mpsc::TrySendError::Full(_)) => {
                 self.state.status = "Window operation is already in progress.".into();
@@ -1286,6 +1323,12 @@ impl VeilKeyApp {
     }
 
     fn process_dynamic_toggle_results(&mut self, english: bool) {
+        if self.is_exit_requested() {
+            while self.dynamic_toggle_rx.try_recv().is_ok() {}
+            self.dynamic_toggle_in_flight = false;
+            self.pending_dynamic_toggles.clear();
+            return;
+        }
         while let Ok((mode, suffix, focused, windows)) = self.dynamic_toggle_rx.try_recv() {
             self.dynamic_toggle_in_flight = false;
             let windows = match windows {
@@ -1419,7 +1462,7 @@ impl VeilKeyApp {
     }
 
     fn start_next_dynamic_toggle(&mut self) {
-        if self.dynamic_toggle_in_flight || self.action_in_flight {
+        if self.is_exit_requested() || self.dynamic_toggle_in_flight || self.action_in_flight {
             return;
         }
         if let Some(role) = self.pending_dynamic_toggles.pop_front() {
@@ -1491,6 +1534,9 @@ impl VeilKeyApp {
     }
 
     fn toggle_group(&mut self, index: usize) {
+        if self.is_exit_requested() {
+            return;
+        }
         if self.action_in_flight || self.dynamic_toggle_in_flight {
             // Preserve the order of groups that may overlap; only adjacent repeated
             // toggles cancel while a native operation is pending.
@@ -1519,6 +1565,10 @@ impl VeilKeyApp {
     }
 
     fn handle_hotkey_events(&mut self) {
+        if self.on_exit_requested() {
+            while self.hotkey_event_rx.try_recv().is_ok() {}
+            return;
+        }
         let mut group_to_toggle = None;
         let mut dynamic_toggle = None;
         while let Ok(event) = self.hotkey_event_rx.try_recv() {
@@ -1586,10 +1636,54 @@ impl VeilKeyApp {
                 }
                 TrayCommand::Exit => {
                     self.exit_requested.store(true, Ordering::Release);
+                    self.queued_toggles.clear();
+                    self.pending_dynamic_toggles.clear();
                 }
             }
         }
-        if self.on_exit_requested() && !self.action_in_flight && !self.dynamic_toggle_in_flight {
+        if self.on_exit_requested() && !self.exit_cleanup_started && !self.exit_cleanup_completed {
+            let groups = self
+                .state
+                .groups
+                .iter()
+                .chain(self.state.dynamic_groups.values())
+                .chain(self.dynamic_recovery.iter())
+                .cloned()
+                .collect();
+            let request = WindowActionRequest::RestoreAndExit {
+                groups,
+                completed: self.exit_cleanup_tx.clone(),
+            };
+            match self.action_tx.try_send(request) {
+                Ok(()) => self.exit_cleanup_started = true,
+                Err(mpsc::TrySendError::Full(_)) => {}
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.state.status =
+                        "Window worker stopped; VeilKey could not restore windows.".into();
+                    self.exit_requested.store(false, Ordering::Release);
+                }
+            }
+        }
+        while let Ok(result) = self.exit_cleanup_rx.try_recv() {
+            self.exit_cleanup_started = false;
+            match result {
+                Ok(()) => {
+                    self.exit_cleanup_completed = true;
+                    self.state.dynamic_groups.clear();
+                    self.dynamic_recovery.clear();
+                    for group in &mut self.state.groups {
+                        group.is_visible = true;
+                    }
+                    self.persist();
+                }
+                Err(error) => {
+                    self.state.status =
+                        format!("Could not restore all windows; VeilKey remains open: {error}");
+                    self.exit_requested.store(false, Ordering::Release);
+                }
+            }
+        }
+        if self.on_exit_requested() && self.exit_cleanup_completed {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
@@ -1597,6 +1691,15 @@ impl VeilKeyApp {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn on_exit_requested(&self) -> bool {
         self.exit_requested.load(Ordering::Acquire)
+    }
+
+    fn is_exit_requested(&self) -> bool {
+        self.on_exit_requested()
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    fn is_exit_requested(&self) -> bool {
+        false
     }
 
     fn dynamic_ui(&mut self, ui: &mut egui::Ui, english: bool, show_bindings: bool) {
@@ -1907,14 +2010,15 @@ impl eframe::App for VeilKeyApp {
         if let Ok(windows) = NativeWindowController::enumerate_fast() {
             self.windows = windows;
         }
-        let actions = restore_session_groups(
-            self.state
-                .groups
-                .iter_mut()
-                .chain(self.state.dynamic_groups.values_mut())
-                .chain(self.dynamic_recovery.iter_mut()),
-            &self.windows,
-        );
+        let groups: Vec<_> = self
+            .state
+            .groups
+            .iter()
+            .chain(self.state.dynamic_groups.values())
+            .chain(self.dynamic_recovery.iter())
+            .cloned()
+            .collect();
+        let actions = restore_all_bound_windows(&groups, &self.windows);
         if let Err(error) = NativeWindowController::apply_actions(actions) {
             eprintln!("Could not restore all windows while exiting: {error}");
         }
@@ -2756,6 +2860,40 @@ mod tests {
     }
 
     #[test]
+    fn exit_restores_hidden_targets_even_when_group_visibility_state_is_stale() {
+        let mut hidden = group("Hidden target", "super+KeyU");
+        hidden.window_ids.insert("hidden-window".into());
+        // The stored group flag can lag a successful async hide operation.
+        hidden.is_visible = true;
+        let windows = [WindowInfo {
+            id: "hidden-window".into(),
+            title: "Target".into(),
+            app: "Example".into(),
+            rect: veilkey::Rect {
+                x: 45,
+                y: 60,
+                width: 800,
+                height: 600,
+            },
+            visible: false,
+            native_handle: 77,
+            process_id: 10,
+            preview: None,
+        }];
+
+        let actions = restore_all_bound_windows(std::slice::from_ref(&hidden), &windows);
+
+        assert!(matches!(
+            actions.as_slice(),
+            [WindowAction::SetVisible {
+                visible: true,
+                handle: 77,
+                ..
+            }]
+        ));
+    }
+
+    #[test]
     fn session_exit_restores_hidden_windows_and_clears_group_hidden_state() {
         let mut hidden = group("Hidden target", "super+Digit9");
         hidden.window_ids.insert("hidden-window".into());
@@ -2771,7 +2909,7 @@ mod tests {
             preview: None,
         }];
 
-        let actions = restore_session_groups([&mut hidden].into_iter(), &windows);
+        let actions = restore_all_bound_windows(std::slice::from_ref(&hidden), &windows);
 
         assert!(matches!(
             actions.as_slice(),
@@ -2781,7 +2919,6 @@ mod tests {
                 ..
             }]
         ));
-        assert!(hidden.is_visible);
     }
 
     #[test]

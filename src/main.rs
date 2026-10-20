@@ -1143,6 +1143,8 @@ impl VeilKeyApp {
         if actions.is_empty() {
             return;
         }
+        #[cfg(target_os = "windows")]
+        veilkey::platform::debug_log(format!("queue window actions count={}", actions.len()));
         match self.action_tx.try_send(WindowActionRequest::Apply(actions)) {
             Ok(()) => self.action_in_flight = true,
             Err(mpsc::TrySendError::Full(_)) => {
@@ -1637,6 +1639,12 @@ impl VeilKeyApp {
         let mut group_to_toggle = None;
         let mut dynamic_toggle = None;
         while let Ok(event) = self.hotkey_event_rx.try_recv() {
+            #[cfg(target_os = "windows")]
+            veilkey::platform::debug_log(format!(
+                "hotkey event id={} state={:?}",
+                event.id(),
+                event.state()
+            ));
             if event.state() != HotKeyState::Pressed {
                 continue;
             }
@@ -1700,6 +1708,8 @@ impl VeilKeyApp {
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
                 TrayCommand::Exit => {
+                    #[cfg(target_os = "windows")]
+                    veilkey::platform::debug_log("tray exit requested");
                     self.exit_requested.store(true, Ordering::Release);
                     self.queued_toggles.clear();
                     self.pending_dynamic_toggles.clear();
@@ -1733,6 +1743,8 @@ impl VeilKeyApp {
             self.exit_cleanup_started = false;
             match result {
                 Ok(()) => {
+                    #[cfg(target_os = "windows")]
+                    veilkey::platform::debug_log("exit window restoration completed");
                     self.exit_cleanup_completed = true;
                     self.state.dynamic_groups.clear();
                     self.dynamic_recovery.clear();
@@ -1742,6 +1754,8 @@ impl VeilKeyApp {
                     self.persist();
                 }
                 Err(error) => {
+                    #[cfg(target_os = "windows")]
+                    veilkey::platform::debug_log(format!("exit restoration failed: {error}"));
                     self.state.status =
                         format!("Could not restore all windows; VeilKey remains open: {error}");
                     self.exit_requested.store(false, Ordering::Release);

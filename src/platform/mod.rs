@@ -6,6 +6,8 @@ mod windows;
 pub use macos::NativeWindowController;
 #[cfg(target_os = "windows")]
 pub use windows::NativeWindowController;
+#[cfg(target_os = "windows")]
+pub use windows::debug_log;
 
 #[cfg(target_os = "windows")]
 pub fn is_fullscreen_window(window_id: &str, windows: &[crate::WindowInfo]) -> bool {

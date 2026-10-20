@@ -65,6 +65,7 @@ fn run_message_thread(
 ) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => {
+            veilkey::platform::debug_log("dedicated hotkey message thread started");
             let _ = ready.send(Ok(()));
             manager
         }
@@ -78,18 +79,31 @@ fn run_message_thread(
         while let Ok(command) = requests.try_recv() {
             match command {
                 Command::Register(hotkey, reply) => {
-                    let _ = reply.send(manager.register(hotkey).map_err(|error| error.to_string()));
+                    let result = manager.register(hotkey).map_err(|error| error.to_string());
+                    veilkey::platform::debug_log(format!(
+                        "register hotkey id={} result={:?}",
+                        hotkey.id, result
+                    ));
+                    let _ = reply.send(result);
                 }
                 Command::Unregister(hotkey, reply) => {
-                    let _ = reply.send(
-                        manager
-                            .unregister(hotkey)
-                            .map_err(|error| error.to_string()),
-                    );
+                    let result = manager
+                        .unregister(hotkey)
+                        .map_err(|error| error.to_string());
+                    veilkey::platform::debug_log(format!(
+                        "unregister hotkey id={} result={:?}",
+                        hotkey.id, result
+                    ));
+                    let _ = reply.send(result);
                 }
             }
         }
         while let Ok(event) = receiver.try_recv() {
+            veilkey::platform::debug_log(format!(
+                "message thread forwarded hotkey id={} state={:?}",
+                event.id(),
+                event.state()
+            ));
             if events.send(event).is_err() {
                 return;
             }

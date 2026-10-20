@@ -1,10 +1,15 @@
 use crate::{Rect, WindowAction, WindowInfo};
 use std::collections::{BTreeMap, HashMap};
 use std::ffi::OsString;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
 use std::os::windows::ffi::OsStringExt;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
+    RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -17,6 +22,39 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
     WS_EX_TOOLWINDOW,
 };
+
+const LOG_LIMIT: u64 = 2 * 1024 * 1024;
+
+pub fn debug_log(message: impl AsRef<str>) {
+    let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
+        return;
+    };
+    let directory = PathBuf::from(local_app_data).join("VeilKey").join("logs");
+    if fs::create_dir_all(&directory).is_err() {
+        return;
+    }
+    let path = directory.join("windows.log");
+    if fs::metadata(&path).is_ok_and(|metadata| metadata.len() >= LOG_LIMIT) {
+        let _ = fs::rename(&path, directory.join("windows.log.1"));
+    }
+    let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) else {
+        return;
+    };
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default();
+    let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
+}
+
+unsafe fn refresh_window_surface(hwnd: HWND) {
+    unsafe {
+        // Invalidate without erasing or forcing synchronous cross-process
+        // painting. GPU-backed windows can expose a black surface when their
+        // background is erased before their renderer produces a new frame.
+        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
+    }
+}
 
 #[derive(Clone)]
 struct RawWindow {
@@ -204,6 +242,7 @@ impl NativeWindowController {
         if actions.is_empty() {
             return Ok(());
         }
+        debug_log(format!("apply_actions count={}", actions.len()));
         let foreground_before = unsafe { GetForegroundWindow() };
         let hiding = actions
             .iter()
@@ -230,7 +269,11 @@ impl NativeWindowController {
                 } => (window_id.as_str(), *handle),
             };
             let hwnd = HWND(handle as *mut core::ffi::c_void);
+            debug_log(format!("action window_id={window_id:?} hwnd=0x{handle:x}"));
             let Some(window_title) = validated_window_title(hwnd, window_id) else {
+                debug_log(format!(
+                    "action rejected hwnd=0x{handle:x}: identity mismatch"
+                ));
                 errors.push(format!(
                     "Window '{window_id}' disappeared or changed identity; refresh and rebind it."
                 ));
@@ -262,7 +305,10 @@ impl NativeWindowController {
                                 flags,
                             )
                             .map_err(|e| e.to_string())
-                            .and_then(|()| verify_window_still_exists(hwnd))
+                            .and_then(|()| {
+                                refresh_window_surface(hwnd);
+                                verify_window_still_exists(hwnd)
+                            })
                         } else if force_popup {
                             SetWindowPos(
                                 hwnd,
@@ -278,11 +324,15 @@ impl NativeWindowController {
                                     | SWP_NOOWNERZORDER,
                             )
                             .map_err(|e| e.to_string())
-                            .and_then(|()| verify_window_still_exists(hwnd))
+                            .and_then(|()| {
+                                refresh_window_surface(hwnd);
+                                verify_window_still_exists(hwnd)
+                            })
                         } else {
                             // Do not touch z-order for the default game-friendly path.
                             // ShowWindowAsync returns the previous visibility state, not success.
                             let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
+                            refresh_window_surface(hwnd);
                             verify_window_still_exists(hwnd)
                         }
                     } else {
@@ -348,7 +398,14 @@ impl NativeWindowController {
                 }
             };
             if let Err(error) = result {
+                debug_log(format!(
+                    "action failed title={window_title:?} hwnd=0x{handle:x}: {error}"
+                ));
                 errors.push(format!("{window_title}: {error}"));
+            } else {
+                debug_log(format!(
+                    "action completed title={window_title:?} hwnd=0x{handle:x}"
+                ));
             }
         }
         // When hiding windows behind a game, restore the already-focused foreground app only
@@ -366,8 +423,10 @@ impl NativeWindowController {
             }
         }
         if errors.is_empty() {
+            debug_log("apply_actions completed");
             Ok(())
         } else {
+            debug_log(format!("apply_actions errors={}", errors.len()));
             Err(format!(
                 "Some group window actions failed: {}",
                 errors.join("; ")

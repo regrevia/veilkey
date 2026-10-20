@@ -293,6 +293,7 @@ struct VeilKeyApp {
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
     registered_hotkey_ids: HashSet<u32>,
+    hotkey_event_rx: Receiver<GlobalHotKeyEvent>,
     recording_group: Option<String>,
     capture_armed: Arc<AtomicBool>,
     capture_listener_alive: Arc<AtomicBool>,
@@ -681,6 +682,7 @@ impl VeilKeyApp {
         let (action_tx, action_requests) = mpsc::sync_channel::<Vec<WindowAction>>(1);
         let (action_results, action_rx) = mpsc::channel();
         let action_refresh_tx = refresh_tx.clone();
+        let action_ctx = ctx.clone();
         thread::spawn(move || {
             while let Ok(actions) = action_requests.recv() {
                 #[cfg(target_os = "windows")]
@@ -700,6 +702,7 @@ impl VeilKeyApp {
                     break;
                 }
                 let _ = action_refresh_tx.try_send(false);
+                action_ctx.request_repaint();
             }
         });
         let capture_armed = Arc::new(AtomicBool::new(false));
@@ -711,6 +714,7 @@ impl VeilKeyApp {
         let (dynamic_toggle_tx, dynamic_toggle_requests) =
             mpsc::sync_channel::<DynamicToggleRequest>(16);
         let (dynamic_toggle_results, dynamic_toggle_rx) = mpsc::channel();
+        let dynamic_toggle_ctx = ctx.clone();
         thread::spawn(move || {
             while let Ok((mode, suffix, previous_window_ids)) = dynamic_toggle_requests.recv() {
                 let (focused, windows) =
@@ -723,6 +727,22 @@ impl VeilKeyApp {
                     .is_err()
                 {
                     break;
+                }
+                dynamic_toggle_ctx.request_repaint();
+            }
+        });
+        let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel();
+        let hotkey_event_ctx = ctx.clone();
+        thread::spawn(move || {
+            let receiver = GlobalHotKeyEvent::receiver();
+            loop {
+                if let Ok(event) = receiver.recv_timeout(Duration::from_millis(100)) {
+                    if hotkey_event_tx.send(event).is_err() {
+                        break;
+                    }
+                    // A hidden native window may stop driving UI timers. Wake
+                    // egui directly when Windows delivers a registered hotkey.
+                    hotkey_event_ctx.request_repaint();
                 }
             }
         });
@@ -809,6 +829,7 @@ impl VeilKeyApp {
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
             registered_hotkey_ids: HashSet::new(),
+            hotkey_event_rx,
             recording_group: None,
             capture_armed,
             capture_listener_alive,
@@ -1500,25 +1521,23 @@ impl VeilKeyApp {
     fn handle_hotkey_events(&mut self) {
         let mut group_to_toggle = None;
         let mut dynamic_toggle = None;
-        if let Some(receiver) = Some(GlobalHotKeyEvent::receiver()) {
-            while let Ok(event) = receiver.try_recv() {
-                if event.state() != HotKeyState::Pressed {
-                    continue;
-                }
-                if let Some(role) = self.dynamic_hotkey_roles.get(&event.id()).cloned() {
-                    dynamic_toggle = Some(role);
-                    break;
-                }
-                group_to_toggle = self.state.groups.iter().position(|group| {
-                    group
-                        .hotkey
-                        .as_deref()
-                        .and_then(|s| HotKey::from_str(s).ok())
-                        .is_some_and(|hotkey| hotkey.id == event.id())
-                });
-                if group_to_toggle.is_some() {
-                    break;
-                }
+        while let Ok(event) = self.hotkey_event_rx.try_recv() {
+            if event.state() != HotKeyState::Pressed {
+                continue;
+            }
+            if let Some(role) = self.dynamic_hotkey_roles.get(&event.id()).cloned() {
+                dynamic_toggle = Some(role);
+                break;
+            }
+            group_to_toggle = self.state.groups.iter().position(|group| {
+                group
+                    .hotkey
+                    .as_deref()
+                    .and_then(|s| HotKey::from_str(s).ok())
+                    .is_some_and(|hotkey| hotkey.id == event.id())
+            });
+            if group_to_toggle.is_some() {
+                break;
             }
         }
         if let Some(role) = dynamic_toggle {

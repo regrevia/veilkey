@@ -1,8 +1,10 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 use eframe::egui;
+#[cfg(not(target_os = "windows"))]
+use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -13,6 +15,13 @@ use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 use veilkey::platform::NativeWindowController;
+
+#[cfg(target_os = "windows")]
+mod windows_hotkeys;
+#[cfg(target_os = "windows")]
+use windows_hotkeys::HotkeyManager;
+#[cfg(not(target_os = "windows"))]
+type HotkeyManager = GlobalHotKeyManager;
 use veilkey::{
     AppState, BindMode, Group, WindowAction, WindowInfo, acquire_instance_lock, dynamic_target_ids,
     load_state, save_state, state_path, window_is_displayable,
@@ -296,7 +305,7 @@ struct VeilKeyApp {
     windows: Vec<WindowInfo>,
     window_rx: Receiver<Result<Vec<WindowInfo>, String>>,
     refresh_tx: mpsc::SyncSender<bool>,
-    hotkeys: Option<GlobalHotKeyManager>,
+    hotkeys: Option<HotkeyManager>,
     state_file: std::path::PathBuf,
     _instance_lock: File,
     filter: String,
@@ -784,7 +793,11 @@ impl VeilKeyApp {
             }
         });
         let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel();
+        #[cfg(target_os = "windows")]
+        let hotkeys = HotkeyManager::new(hotkey_event_tx.clone()).ok();
+        #[cfg(not(target_os = "windows"))]
         let hotkey_event_ctx = ctx.clone();
+        #[cfg(not(target_os = "windows"))]
         thread::spawn(move || {
             let receiver = GlobalHotKeyEvent::receiver();
             loop {
@@ -878,6 +891,7 @@ impl VeilKeyApp {
                 thread::sleep(delay);
             }
         });
+        #[cfg(not(target_os = "windows"))]
         let hotkeys = GlobalHotKeyManager::new().ok();
         let mut app = Self {
             state,
@@ -1175,11 +1189,23 @@ impl VeilKeyApp {
         }
     }
 
+    #[allow(unreachable_code)]
     fn retry_hotkeys_if_needed(&mut self) {
         if !self.hotkey_retry_needed || self.last_hotkey_retry.elapsed() < Duration::from_secs(5) {
             return;
         }
         self.last_hotkey_retry = Instant::now();
+        #[cfg(target_os = "windows")]
+        {
+            if self.hotkeys.is_none() {
+                // The Windows manager owns a dedicated message thread and
+                // cannot be recreated without its event forwarding channel.
+                self.state.status =
+                    "Windows hotkey thread is unavailable; restart VeilKey to retry.".into();
+            }
+            return;
+        }
+        #[cfg(not(target_os = "windows"))]
         if self.hotkeys.is_none() {
             let Ok(manager) = GlobalHotKeyManager::new() else {
                 return;

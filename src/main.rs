@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use eframe::egui;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -683,13 +685,18 @@ impl VeilKeyApp {
         let action_refresh_tx = refresh_tx.clone();
         thread::spawn(move || {
             while let Ok(actions) = action_requests.recv() {
-                let retry = actions.clone();
-                let applied = match NativeWindowController::apply_actions(actions) {
-                    Ok(()) => Ok(()),
-                    Err(first) => match NativeWindowController::apply_actions(retry) {
+                #[cfg(target_os = "windows")]
+                let applied = NativeWindowController::apply_actions(actions);
+                #[cfg(not(target_os = "windows"))]
+                let applied = {
+                    let retry = actions.clone();
+                    match NativeWindowController::apply_actions(actions) {
                         Ok(()) => Ok(()),
-                        Err(second) => Err(format!("{first}; retry failed: {second}")),
-                    },
+                        Err(first) => match NativeWindowController::apply_actions(retry) {
+                            Ok(()) => Ok(()),
+                            Err(second) => Err(format!("{first}; retry failed: {second}")),
+                        },
+                    }
                 };
                 if action_results.send((applied, Ok(Vec::new()))).is_err() {
                     break;

@@ -786,6 +786,16 @@ impl VeilKeyApp {
                 }
             }
         });
+        // A hidden Windows viewport can stop scheduling regular egui updates.
+        // Keep the event loop awake so queued global-hotkey events and window
+        // operation results are consumed even while VeilKey itself is hidden.
+        let heartbeat_ctx = ctx.clone();
+        thread::spawn(move || {
+            loop {
+                thread::sleep(Duration::from_millis(16));
+                heartbeat_ctx.request_repaint();
+            }
+        });
         thread::spawn(move || {
             let mut failures = 0_u32;
             loop {
@@ -1084,14 +1094,20 @@ impl VeilKeyApp {
             .map(|role| (role.hotkey.id, role))
             .collect();
         self.hotkey_retry_needed = !registration_errors.is_empty();
-        self.state.status = if registration_errors.is_empty() {
-            "Dynamic shortcut ranges registered.".into()
-        } else {
+        // Windows reserves several modifier/key combinations (for example
+        // Win+number). Keep the usable roles active and retry failed roles in
+        // the background, but do not present a transient startup warning as a
+        // fatal configuration state.
+        self.state.status = if self.dynamic_hotkey_roles.is_empty() {
             format!(
-                "Shortcut range partially registered: {} shortcut(s) unavailable. First error: {}",
-                registration_errors.len(),
-                registration_errors[0]
+                "No dynamic shortcuts are currently available; retrying registration.{}",
+                registration_errors
+                    .first()
+                    .map(|error| format!(" {error}"))
+                    .unwrap_or_default()
             )
+        } else {
+            "Dynamic shortcut ranges registered.".into()
         };
         self.persist();
         true
@@ -1195,11 +1211,11 @@ impl VeilKeyApp {
         if failed.is_empty() {
             self.state.status = "Shortcuts recovered.".into();
         }
-        if self.state.bind_mode.is_dynamic()
-            && self.dynamic_hotkey_roles.is_empty()
-            && !self.register_dynamic_hotkeys()
-        {
-            self.hotkey_retry_needed = true;
+        if self.state.bind_mode.is_dynamic() && self.hotkey_retry_needed {
+            // Re-run the complete plan so roles that failed because another
+            // process temporarily owned a combination can join later, while
+            // already registered roles remain untouched.
+            let _ = self.register_dynamic_hotkeys();
         }
     }
 

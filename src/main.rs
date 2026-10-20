@@ -369,14 +369,8 @@ fn plan_dynamic_hotkeys(state: &AppState) -> Result<Vec<DynamicHotkeyRole>, Stri
     {
         return Err("请选择有效的修饰键组合。".into());
     }
-    for (suffix, chord) in state
-        .dynamic_suffixes
-        .iter()
-        .zip(veilkey::dynamic_hotkey_combinations(
-            modifiers,
-            &state.dynamic_suffixes,
-        ))
-    {
+    for chord in veilkey::dynamic_hotkey_combinations(modifiers, &state.dynamic_suffixes) {
+        let suffix = chord.rsplit('+').next().unwrap_or_default();
         let hotkey = HotKey::from_str(&chord).map_err(|error| error.to_string())?;
         if !ids.insert(hotkey.id) {
             return Err("快捷键不能重复。".into());
@@ -391,7 +385,7 @@ fn plan_dynamic_hotkeys(state: &AppState) -> Result<Vec<DynamicHotkeyRole>, Stri
             return Err(format!("快捷键与窗口组合冲突：{chord}"));
         }
         roles.push(DynamicHotkeyRole {
-            suffix: suffix.clone(),
+            suffix: suffix.to_owned(),
             hotkey,
         });
     }
@@ -610,6 +604,15 @@ impl VeilKeyApp {
     fn new(instance_lock: File, ctx: &egui::Context) -> Self {
         let state_file = state_path();
         let mut state = load_state(&state_file);
+        #[cfg(target_os = "windows")]
+        if state.dynamic_toggle_modifiers == ["super"]
+            && state.dynamic_suffixes == ["Digit9", "Digit0", "Minus", "Equal"]
+        {
+            // Older Windows builds defaulted to Win+number, which Windows
+            // reserves for taskbar app switching. Migrate only that exact
+            // untouched default so existing installs remain usable.
+            state.dynamic_toggle_modifiers = vec!["ctrl".into(), "alt".into()];
+        }
         let mut dynamic_recovery: Vec<Group> = std::mem::take(&mut state.dynamic_groups)
             .into_values()
             .filter(|group| !group.is_visible)
@@ -1592,10 +1595,20 @@ impl VeilKeyApp {
                 ui.add(
                     egui::TextEdit::singleline(&mut self.dynamic_suffix_input)
                         .desired_width(330.0)
-                        .hint_text("9 0 - ="),
+                        .hint_text(tr(
+                            english,
+                            "u i o / F1 F2 / 9 0 - =",
+                            "u i o / F1 F2 / 9 0 - =",
+                        )),
                 );
                 ui.end_row();
             });
+        ui.add_space(8.0);
+        ui.weak(tr(
+            english,
+            "Each allowed key is registered with every pair of selected modifiers. Example: Shift+Ctrl+U, Shift+Alt+U, Ctrl+Alt+U.",
+            "每个允许按键都会与已勾选修饰键中的任意两键组合绑定。例如：Shift+Ctrl+U、Shift+Alt+U、Ctrl+Alt+U。",
+        ));
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             reset = ui
@@ -2491,7 +2504,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_modifiers_form_one_shortcut_per_suffix() {
+    fn selected_modifiers_form_every_pair_per_suffix() {
         let state = AppState {
             bind_mode: BindMode::OneWindowAtATime,
             ..Default::default()
@@ -2514,10 +2527,24 @@ mod tests {
             roles[0].hotkey,
             HotKey::from_str("super+shift+KeyU").unwrap()
         );
+        let all_modifiers = AppState {
+            dynamic_toggle_modifiers: vec![
+                "super".into(),
+                "ctrl".into(),
+                "alt".into(),
+                "shift".into(),
+            ],
+            dynamic_suffixes: vec!["KeyU".into(), "KeyI".into(), "KeyO".into()],
+            bind_mode: BindMode::OneWindowAtATime,
+            ..Default::default()
+        };
+        let roles = plan_dynamic_hotkeys(&all_modifiers).unwrap();
+        assert_eq!(roles.len(), 18);
+        assert_eq!(roles.iter().filter(|role| role.suffix == "KeyU").count(), 6);
     }
 
     #[test]
-    fn dynamic_hotkey_uses_exactly_the_selected_modifier_combination() {
+    fn dynamic_hotkey_uses_each_selected_modifier_pair() {
         let state = AppState {
             bind_mode: BindMode::OneWindowAtATime,
             dynamic_toggle_modifiers: vec!["super".into(), "shift".into()],
@@ -2541,7 +2568,8 @@ mod tests {
         assert!(plan_dynamic_hotkeys(&state).is_ok());
         state.dynamic_toggle_modifiers.push("shift".into());
         let combined = plan_dynamic_hotkeys(&state).unwrap();
-        assert!(combined.iter().all(|role| {
+        assert_eq!(combined.len(), state.dynamic_suffixes.len() * 3);
+        assert!(combined.iter().any(|role| {
             role.hotkey
                 .mods
                 .contains(global_hotkey::hotkey::Modifiers::SHIFT)
@@ -2549,9 +2577,7 @@ mod tests {
         state.dynamic_suffixes = vec![];
         assert!(plan_dynamic_hotkeys(&state).is_err());
         state.dynamic_suffixes = vec!["Digit9".into()];
-        state
-            .groups
-            .push(group("Conflicting", "super+shift+Digit9"));
+        state.groups.push(group("Conflicting", "ctrl+shift+Digit9"));
         assert!(plan_dynamic_hotkeys(&state).is_err());
         state.groups.clear();
         state.dynamic_toggle_modifiers.clear();

@@ -115,6 +115,9 @@ pub enum BindMode {
 }
 
 fn default_dynamic_toggle_modifiers() -> Vec<String> {
+    #[cfg(target_os = "windows")]
+    return vec!["ctrl".into(), "alt".into()];
+    #[cfg(not(target_os = "windows"))]
     vec!["super".into()]
 }
 
@@ -140,14 +143,27 @@ pub fn dynamic_hotkey_combinations(modifiers: &[String], suffixes: &[String]) ->
     let mut suffixes = suffixes;
     let mut seen = BTreeSet::new();
     suffixes.retain(|suffix| seen.insert(suffix.clone()));
+    let modifier_sets: Vec<Vec<&str>> = if modifiers.len() < 2 {
+        vec![modifiers.iter().map(String::as_str).collect()]
+    } else {
+        let mut pairs = Vec::new();
+        for first in 0..modifiers.len() {
+            for second in (first + 1)..modifiers.len() {
+                pairs.push(vec![modifiers[first].as_str(), modifiers[second].as_str()]);
+            }
+        }
+        pairs
+    };
     suffixes
         .into_iter()
-        .map(|suffix| {
-            if modifiers.is_empty() {
-                suffix
-            } else {
-                format!("{}+{suffix}", modifiers.join("+"))
-            }
+        .flat_map(|suffix| {
+            modifier_sets.iter().map(move |combination| {
+                if combination.is_empty() {
+                    suffix.clone()
+                } else {
+                    format!("{}+{suffix}", combination.join("+"))
+                }
+            })
         })
         .collect()
 }
@@ -947,6 +963,27 @@ mod tests {
                 &["Digit9".into(), "Digit0".into(), "Digit9".into()]
             ),
             vec!["super+Digit9", "super+Digit0"]
+        );
+    }
+
+    #[test]
+    fn dynamic_shortcut_range_expands_all_modifier_pairs_for_each_suffix() {
+        assert_eq!(
+            dynamic_hotkey_combinations(
+                &["shift".into(), "ctrl".into(), "alt".into()],
+                &["KeyU".into(), "KeyI".into(), "KeyO".into()]
+            ),
+            vec![
+                "alt+ctrl+KeyU",
+                "alt+shift+KeyU",
+                "ctrl+shift+KeyU",
+                "alt+ctrl+KeyI",
+                "alt+shift+KeyI",
+                "ctrl+shift+KeyI",
+                "alt+ctrl+KeyO",
+                "alt+shift+KeyO",
+                "ctrl+shift+KeyO",
+            ]
         );
     }
 

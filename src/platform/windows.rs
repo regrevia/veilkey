@@ -47,6 +47,49 @@ pub fn debug_log(message: impl AsRef<str>) {
     let _ = writeln!(file, "[{timestamp}] {}", message.as_ref());
 }
 
+/// Makes the hidden VeilKey viewport visible without relying on egui to process
+/// a queued viewport command (which is exactly what may stop while hidden).
+pub fn wake_main_window() -> Result<isize, String> {
+    use windows::Win32::System::Threading::GetCurrentProcessId;
+
+    let current_pid = unsafe { GetCurrentProcessId() };
+    let mut state = (current_pid, HWND::default());
+    unsafe extern "system" fn find_main_window(hwnd: HWND, state: LPARAM) -> BOOL {
+        unsafe {
+            let (pid, target) = &mut *(state.0 as *mut (u32, HWND));
+            let mut window_pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+            if window_pid == *pid && window_title(hwnd).as_deref() == Some("VeilKey") {
+                *target = hwnd;
+                return BOOL(0);
+            }
+            BOOL(1)
+        }
+    }
+
+    unsafe {
+        EnumWindows(
+            Some(find_main_window),
+            LPARAM(&mut state as *mut _ as isize),
+        )
+        .map_err(|error| format!("Could not enumerate VeilKey's own window: {error}"))?;
+    }
+    let target = state.1;
+    if target.0.is_null() {
+        return Err(format!(
+            "No VeilKey main window was found for process {current_pid}."
+        ));
+    }
+    // The BOOL return value reports the previous visibility state; FALSE is
+    // expected for the hidden-window case and does not mean the request failed.
+    let was_visible = unsafe { ShowWindowAsync(target, SW_SHOWNOACTIVATE) }.as_bool();
+    debug_log(format!(
+        "native wake requested hwnd=0x{:x} previously_visible={was_visible}",
+        target.0 as usize
+    ));
+    Ok(target.0 as isize)
+}
+
 unsafe fn refresh_window_surface(hwnd: HWND) {
     unsafe {
         // Invalidate without erasing or forcing synchronous cross-process

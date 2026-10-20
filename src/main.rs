@@ -144,6 +144,15 @@ fn create_tray(
                 menu_exit_requested.store(true, Ordering::Release);
                 #[cfg(target_os = "windows")]
                 veilkey::platform::debug_log("tray exit flag set in callback");
+                #[cfg(target_os = "windows")]
+                match veilkey::platform::wake_main_window() {
+                    Ok(hwnd) => veilkey::platform::debug_log(format!(
+                        "tray exit woke native window hwnd=0x{hwnd:x}"
+                    )),
+                    Err(error) => veilkey::platform::debug_log(format!(
+                        "tray exit native wake failed: {error}"
+                    )),
+                }
                 menu_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             } else if matches!(command, TrayCommand::Show) {
                 menu_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
@@ -168,6 +177,15 @@ fn create_tray(
         ) {
             #[cfg(target_os = "windows")]
             veilkey::platform::debug_log("tray icon activation callback");
+            #[cfg(target_os = "windows")]
+            match veilkey::platform::wake_main_window() {
+                Ok(hwnd) => veilkey::platform::debug_log(format!(
+                    "tray show woke native window hwnd=0x{hwnd:x}"
+                )),
+                Err(error) => {
+                    veilkey::platform::debug_log(format!("tray show native wake failed: {error}"))
+                }
+            }
             let _ = sender.send(TrayCommand::Show);
             tray_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             tray_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -849,6 +867,16 @@ impl VeilKeyApp {
                         event.id(),
                         event.state()
                     ));
+                    match veilkey::platform::wake_main_window() {
+                        Ok(hwnd) => veilkey::platform::debug_log(format!(
+                            "hotkey native wake succeeded id={} hwnd=0x{hwnd:x}",
+                            event.id()
+                        )),
+                        Err(error) => veilkey::platform::debug_log(format!(
+                            "hotkey native wake failed id={}: {error}",
+                            event.id()
+                        )),
+                    }
                     wake_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     wake_ctx.request_repaint();
                     if hotkey_event_tx.send(event).is_err() {

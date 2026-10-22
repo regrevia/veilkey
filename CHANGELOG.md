@@ -1,5 +1,10 @@
 ## Unreleased
 
+- Add multi-window groups with one global shortcut, including selection count feedback and collapsible group members.
+- Keep hidden VeilKey window state stable while global shortcuts wake the native viewport, avoiding repeated visibility commands that can produce black frames.
+- Preserve the foreground application during Windows group operations and refresh GPU-backed window surfaces without erasing their contents.
+- Keep a hidden dynamic shortcut slot bound to its saved windows when Windows shifts foreground focus automatically; dispatch group visibility changes together to reduce staggered transitions.
+- Report partial dynamic shortcut registration accurately, retry the full configured range, and explain how to use saved multi-window groups when every dynamic shortcut is occupied.
 - Add a Windows-only preview packaging workflow that builds the installer and portable executable, verifies a full installer/uninstaller cycle, and uploads temporary CI artifacts without creating a Release.
 - Refresh stale Windows window state before applying a shortcut toggle, so changes made externally between polling intervals do not drive actions from an old visibility snapshot.
 - Serialize Windows desktop enumeration, focused-window lookup, and window-group changes through one poison-tolerant native API lock to avoid overlapping window-state reads and mutations.

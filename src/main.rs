@@ -2,9 +2,11 @@
 
 use eframe::egui;
 #[cfg(not(target_os = "windows"))]
+use global_hotkey::GlobalHotKeyEvent;
+#[cfg(not(target_os = "windows"))]
 use global_hotkey::GlobalHotKeyManager;
+use global_hotkey::HotKeyState;
 use global_hotkey::hotkey::HotKey;
-use global_hotkey::{GlobalHotKeyEvent, HotKeyState};
 use std::collections::VecDeque;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -19,7 +21,11 @@ use veilkey::platform::NativeWindowController;
 #[cfg(target_os = "windows")]
 mod windows_hotkeys;
 #[cfg(target_os = "windows")]
+use windows_hotkeys::HotkeyEvent;
+#[cfg(target_os = "windows")]
 use windows_hotkeys::HotkeyManager;
+#[cfg(not(target_os = "windows"))]
+type HotkeyEvent = GlobalHotKeyEvent;
 #[cfg(not(target_os = "windows"))]
 type HotkeyManager = GlobalHotKeyManager;
 use veilkey::{
@@ -41,6 +47,9 @@ fn localized_status(english: bool, status: &str) -> String {
     match status {
         "Shortcut registered." => "快捷键已绑定。".into(),
         "Dynamic shortcut ranges registered." => "快捷键范围已生效。".into(),
+        "No dynamic shortcuts are currently available; switch to Window combination mode or free one of the configured shortcuts." => {
+            "当前动态快捷键都被占用；请切换到“多窗口组合”，或释放一个已配置的快捷键。".into()
+        }
         "Shortcut range saved. Select a dynamic mode to activate it." => {
             "快捷键范围已保存；切换到动态模式后即可启用。".into()
         }
@@ -76,7 +85,7 @@ fn localized_status(english: bool, status: &str) -> String {
             status.trim_start_matches("Could not register shortcut range:")
         ),
         _ if status.starts_with("Shortcut range partially registered:") => format!(
-            "部分快捷键因系统或其他程序占用而未启用，其余可用按键仍然有效。{}",
+            "快捷键范围部分生效。{}",
             status.trim_start_matches("Shortcut range partially registered:")
         ),
         _ if status.starts_with("Some group window actions failed:") => {
@@ -339,7 +348,7 @@ struct VeilKeyApp {
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
     registered_hotkey_ids: HashSet<u32>,
-    hotkey_event_rx: Receiver<GlobalHotKeyEvent>,
+    hotkey_event_rx: Receiver<HotkeyEvent>,
     recording_group: Option<String>,
     capture_armed: Arc<AtomicBool>,
     capture_listener_alive: Arc<AtomicBool>,
@@ -352,7 +361,7 @@ struct VeilKeyApp {
     dynamic_toggle_rx: Receiver<DynamicToggleLookup>,
     dynamic_toggle_tx: mpsc::SyncSender<DynamicToggleRequest>,
     dynamic_toggle_in_flight: bool,
-    pending_dynamic_toggles: VecDeque<DynamicHotkeyRole>,
+    pending_dynamic_toggles: VecDeque<(DynamicHotkeyRole, Option<isize>)>,
     dynamic_hotkey_roles: HashMap<u32, DynamicHotkeyRole>,
     dynamic_range_draft: AppState,
     dynamic_suffix_input: String,
@@ -368,6 +377,10 @@ struct VeilKeyApp {
     exit_cleanup_completed: bool,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     viewport_hidden: bool,
+    #[cfg(target_os = "windows")]
+    wake_for_hidden_viewport: Arc<AtomicBool>,
+    #[cfg(target_os = "windows")]
+    tray_hidden: bool,
     queued_toggles: VecDeque<String>,
     preview_textures: HashMap<String, egui::TextureHandle>,
     preview_pixels: HashMap<String, veilkey::WindowPreview>,
@@ -379,7 +392,11 @@ struct VeilKeyApp {
     exit_requested: Arc<AtomicBool>,
 }
 
-type ActionCompletion = (Result<(), String>, Result<Vec<WindowInfo>, String>);
+type ActionCompletion = (
+    Result<(), String>,
+    Result<Vec<WindowInfo>, String>,
+    Vec<(String, bool)>,
+);
 enum WindowActionRequest {
     Apply(Vec<WindowAction>),
     RestoreAndExit {
@@ -398,7 +415,7 @@ type DynamicToggleLookup = (
     Result<Option<String>, String>,
     Result<Vec<WindowInfo>, String>,
 );
-type DynamicToggleRequest = (BindMode, String, Vec<String>, Vec<String>);
+type DynamicToggleRequest = (BindMode, String, Vec<String>, Vec<String>, Option<isize>);
 
 #[derive(Clone)]
 struct DynamicHotkeyRole {
@@ -464,6 +481,21 @@ fn plan_dynamic_hotkeys(state: &AppState) -> Result<Vec<DynamicHotkeyRole>, Stri
     Ok(roles)
 }
 
+fn dynamic_registration_status(active: usize, total: usize, failed: bool) -> String {
+    if total == 0 {
+        return String::new();
+    }
+    if active == 0 {
+        return "No dynamic shortcuts are currently available; switch to Window combination mode or free one of the configured shortcuts.".into();
+    }
+    if failed {
+        return format!(
+            "Shortcut range partially registered: {active}/{total} shortcuts are available."
+        );
+    }
+    "Dynamic shortcut ranges registered.".into()
+}
+
 fn readable_chord(chord: &str, macos: bool) -> String {
     let mut parts: Vec<_> = chord.split('+').map(str::to_owned).collect();
     let suffix = parts.pop().unwrap_or_default();
@@ -472,14 +504,6 @@ fn readable_chord(chord: &str, macos: bool) -> String {
 
 fn is_bound_in_session(group: &Group) -> bool {
     !group.window_ids.is_empty()
-}
-
-fn is_own_window_id(window_id: &str) -> bool {
-    window_id
-        .split('|')
-        .find_map(|part| part.strip_prefix("pid:"))
-        .and_then(|pid| pid.parse::<u32>().ok())
-        == Some(std::process::id())
 }
 
 fn preserve_logically_hidden_windows(windows: &mut [WindowInfo], hidden_ids: &HashSet<String>) {
@@ -491,6 +515,68 @@ fn preserve_logically_hidden_windows(windows: &mut [WindowInfo], hidden_ids: &Ha
             window.visible = false;
         }
     }
+}
+
+fn is_own_window_id(window_id: &str) -> bool {
+    window_id
+        .split('|')
+        .find_map(|part| part.strip_prefix("pid:"))
+        .and_then(|pid| pid.parse::<u32>().ok())
+        == Some(std::process::id())
+}
+
+fn is_main_window_id(window_id: &str) -> bool {
+    is_own_window_id(window_id) && window_id.split('\0').nth(1) == Some("VeilKey")
+}
+
+fn main_window_is_logically_hidden(hidden_ids: &HashSet<String>) -> bool {
+    hidden_ids.iter().any(|id| is_main_window_id(id))
+}
+
+fn reconcile_self_hidden_windows(
+    windows: &[WindowInfo],
+    hidden_ids: &mut HashSet<String>,
+    targeted_ids: &[(String, bool)],
+) {
+    for (targeted_id, requested_visible) in targeted_ids {
+        if let Some(window) = windows
+            .iter()
+            .find(|window| veilkey::same_window_id(&window.id, targeted_id))
+        {
+            if window.visible {
+                hidden_ids.retain(|id| !veilkey::same_window_id(id, &window.id));
+            } else if !hidden_ids
+                .iter()
+                .any(|id| veilkey::same_window_id(id, &window.id))
+            {
+                hidden_ids.insert(window.id.clone());
+            }
+        } else if *requested_visible {
+            hidden_ids.retain(|id| !veilkey::same_window_id(id, targeted_id));
+        } else if !hidden_ids
+            .iter()
+            .any(|id| veilkey::same_window_id(id, targeted_id))
+        {
+            hidden_ids.insert(targeted_id.clone());
+        }
+    }
+}
+
+fn apply_self_visibility_requests(hidden_ids: &mut HashSet<String>, requests: &[(String, bool)]) {
+    for (id, visible) in requests {
+        if *visible {
+            hidden_ids.retain(|hidden| !veilkey::same_window_id(hidden, id));
+        } else if !hidden_ids
+            .iter()
+            .any(|hidden| veilkey::same_window_id(hidden, id))
+        {
+            hidden_ids.insert(id.clone());
+        }
+    }
+}
+
+fn viewport_visibility_command(currently_hidden: bool, should_hide: bool) -> Option<bool> {
+    (currently_hidden != should_hide).then_some(!should_hide)
 }
 
 fn available_suffixes() -> Vec<(String, String)> {
@@ -608,6 +694,12 @@ fn should_bind_slot(group: Option<&Group>, focused: Option<&str>, windows: &[Win
             .any(|window| veilkey::same_window_id(&window.id, id))
     }) {
         return true;
+    }
+    // Hiding the target often moves Windows focus to an unrelated window.
+    // A second shortcut press must reveal the saved target, not bind that
+    // incidental foreground window into its slot.
+    if !group.is_visible {
+        return false;
     }
     if focused.is_some_and(|id| {
         windows
@@ -815,6 +907,20 @@ impl VeilKeyApp {
                 match request {
                     WindowActionRequest::Apply(actions) => {
                         #[cfg(target_os = "windows")]
+                        let self_visibility_targets = actions
+                            .iter()
+                            .filter_map(|action| match action {
+                                WindowAction::SetVisible {
+                                    window_id, visible, ..
+                                } if is_own_window_id(window_id) => {
+                                    Some((window_id.clone(), *visible))
+                                }
+                                _ => None,
+                            })
+                            .collect::<Vec<_>>();
+                        #[cfg(not(target_os = "windows"))]
+                        let self_visibility_targets = Vec::new();
+                        #[cfg(target_os = "windows")]
                         let applied = NativeWindowController::apply_actions(actions);
                         #[cfg(not(target_os = "windows"))]
                         let applied = {
@@ -827,7 +933,14 @@ impl VeilKeyApp {
                                 },
                             }
                         };
-                        if action_results.send((applied, Ok(Vec::new()))).is_err() {
+                        #[cfg(target_os = "windows")]
+                        let snapshot = NativeWindowController::enumerate_fast();
+                        #[cfg(not(target_os = "windows"))]
+                        let snapshot = Ok(Vec::new());
+                        if action_results
+                            .send((applied, snapshot, self_visibility_targets))
+                            .is_err()
+                        {
                             break;
                         }
                     }
@@ -860,12 +973,29 @@ impl VeilKeyApp {
         let (dynamic_toggle_results, dynamic_toggle_rx) = mpsc::channel();
         let dynamic_toggle_ctx = ctx.clone();
         thread::spawn(move || {
-            while let Ok((mode, suffix, _previous_window_ids, self_hidden_window_ids)) =
-                dynamic_toggle_requests.recv()
+            while let Ok((
+                mode,
+                suffix,
+                _previous_window_ids,
+                self_hidden_window_ids,
+                foreground_handle,
+            )) = dynamic_toggle_requests.recv()
             {
-                let (focused, windows) = match NativeWindowController::focused_window_snapshot(
-                    &self_hidden_window_ids,
-                ) {
+                #[cfg(target_os = "windows")]
+                let snapshot = match foreground_handle {
+                    Some(handle) => NativeWindowController::focused_window_snapshot_for_handle(
+                        handle,
+                        &self_hidden_window_ids,
+                    ),
+                    None => {
+                        NativeWindowController::focused_window_snapshot(&self_hidden_window_ids)
+                    }
+                };
+                #[cfg(not(target_os = "windows"))]
+                let snapshot = NativeWindowController::foreground_window_id().and_then(|focused| {
+                    NativeWindowController::enumerate().map(|windows| (focused, windows))
+                });
+                let (focused, windows) = match snapshot {
                     Ok((focused, windows)) => (Ok(focused), Ok(windows)),
                     Err(error) => (Err(error.clone()), Err(error)),
                 };
@@ -878,36 +1008,44 @@ impl VeilKeyApp {
                 dynamic_toggle_ctx.request_repaint();
             }
         });
-        let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel();
+        let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel::<HotkeyEvent>();
         #[cfg(target_os = "windows")]
         let (raw_hotkey_tx, raw_hotkey_rx) = mpsc::channel();
+        #[cfg(target_os = "windows")]
+        let wake_for_hidden_viewport = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
         let hotkeys = HotkeyManager::new(raw_hotkey_tx).ok();
         #[cfg(target_os = "windows")]
         {
             let wake_ctx = ctx.clone();
+            let wake_required = Arc::clone(&wake_for_hidden_viewport);
             thread::spawn(move || {
-                while let Ok(event) = raw_hotkey_rx.recv() {
-                    // A hidden native viewport may stop driving egui updates.
-                    // Wake it explicitly, then let update() consume the event.
+                while let Ok(mut hotkey) = raw_hotkey_rx.recv() {
+                    let event = hotkey.event;
+                    let needs_native_wake = event.state() == HotKeyState::Pressed
+                        && wake_required.load(Ordering::Acquire);
+                    hotkey.woke_hidden_viewport = needs_native_wake;
                     veilkey::platform::debug_log(format!(
-                        "hotkey wake requested id={} state={:?}",
+                        "hotkey event forwarded id={} state={:?} foreground=0x{:x} viewport_hidden={needs_native_wake}",
                         event.id(),
-                        event.state()
+                        event.state(),
+                        hotkey.foreground_handle
                     ));
-                    match veilkey::platform::wake_main_window() {
-                        Ok(hwnd) => veilkey::platform::debug_log(format!(
-                            "hotkey native wake succeeded id={} hwnd=0x{hwnd:x}",
-                            event.id()
-                        )),
-                        Err(error) => veilkey::platform::debug_log(format!(
-                            "hotkey native wake failed id={}: {error}",
-                            event.id()
-                        )),
+                    if needs_native_wake {
+                        match veilkey::platform::wake_main_window() {
+                            Ok(hwnd) => veilkey::platform::debug_log(format!(
+                                "hotkey native wake succeeded id={} hwnd=0x{hwnd:x}",
+                                event.id()
+                            )),
+                            Err(error) => veilkey::platform::debug_log(format!(
+                                "hotkey native wake failed id={}: {error}",
+                                event.id()
+                            )),
+                        }
+                        wake_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     }
-                    wake_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     wake_ctx.request_repaint();
-                    if hotkey_event_tx.send(event).is_err() {
+                    if hotkey_event_tx.send(hotkey).is_err() {
                         break;
                     }
                 }
@@ -1052,6 +1190,10 @@ impl VeilKeyApp {
             exit_cleanup_completed: false,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             viewport_hidden: false,
+            #[cfg(target_os = "windows")]
+            wake_for_hidden_viewport,
+            #[cfg(target_os = "windows")]
+            tray_hidden: false,
             queued_toggles: VecDeque::new(),
             preview_textures: HashMap::new(),
             preview_pixels: HashMap::new(),
@@ -1235,6 +1377,7 @@ impl VeilKeyApp {
             self.registered_hotkey_ids.remove(&role.hotkey.id);
             removed.push(role.clone());
         }
+        let planned_count = planned.len();
         self.dynamic_hotkey_roles = planned
             .into_iter()
             .filter(|role| self.registered_hotkey_ids.contains(&role.hotkey.id))
@@ -1245,17 +1388,11 @@ impl VeilKeyApp {
         // Win+number). Keep the usable roles active and retry failed roles in
         // the background, but do not present a transient startup warning as a
         // fatal configuration state.
-        self.state.status = if self.dynamic_hotkey_roles.is_empty() {
-            format!(
-                "No dynamic shortcuts are currently available; retrying registration.{}",
-                registration_errors
-                    .first()
-                    .map(|error| format!(" {error}"))
-                    .unwrap_or_default()
-            )
-        } else {
-            "Dynamic shortcut ranges registered.".into()
-        };
+        self.state.status = dynamic_registration_status(
+            self.dynamic_hotkey_roles.len(),
+            planned_count,
+            !registration_errors.is_empty(),
+        );
         self.persist();
         true
     }
@@ -1264,23 +1401,29 @@ impl VeilKeyApp {
         if actions.is_empty() {
             return;
         }
-        for action in &actions {
-            if let WindowAction::SetVisible {
-                window_id, visible, ..
-            } = action
-                && is_own_window_id(window_id)
-            {
-                if *visible {
-                    self.self_hidden_window_ids.remove(window_id);
-                } else {
-                    self.self_hidden_window_ids.insert(window_id.clone());
-                }
-            }
-        }
+        #[cfg(target_os = "windows")]
+        let hides_main_window = actions.iter().any(|action| {
+            matches!(
+                action,
+                WindowAction::SetVisible {
+                    window_id,
+                    visible: false,
+                    ..
+                } if is_main_window_id(window_id)
+            )
+        });
         #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!("queue window actions count={}", actions.len()));
         match self.action_tx.try_send(WindowActionRequest::Apply(actions)) {
-            Ok(()) => self.action_in_flight = true,
+            Ok(()) => {
+                self.action_in_flight = true;
+                #[cfg(target_os = "windows")]
+                if hides_main_window {
+                    // Once the native HWND is hidden, eframe stops producing
+                    // frames. The next global hotkey must wake it to consume events.
+                    self.wake_for_hidden_viewport.store(true, Ordering::Release);
+                }
+            }
             Err(mpsc::TrySendError::Full(_)) => {
                 self.state.status = "Window operation is already in progress.".into();
             }
@@ -1291,15 +1434,31 @@ impl VeilKeyApp {
     }
 
     fn update_window_actions(&mut self) {
-        while let Ok((applied, snapshot)) = self.action_rx.try_recv() {
+        while let Ok((applied, snapshot, self_visibility_targets)) = self.action_rx.try_recv() {
             self.action_in_flight = false;
+            let applied_successfully = applied.is_ok();
             match applied {
                 Ok(()) => {}
                 Err(error) => self.state.status = error,
             }
+            #[cfg(target_os = "windows")]
+            if applied_successfully
+                && (snapshot.is_err() || snapshot.as_ref().is_ok_and(|windows| windows.is_empty()))
+            {
+                apply_self_visibility_requests(
+                    &mut self.self_hidden_window_ids,
+                    &self_visibility_targets,
+                );
+            }
             match snapshot {
                 Ok(windows) => {
                     if !windows.is_empty() {
+                        #[cfg(target_os = "windows")]
+                        reconcile_self_hidden_windows(
+                            &windows,
+                            &mut self.self_hidden_window_ids,
+                            &self_visibility_targets,
+                        );
                         retain_unrestored_targets(&mut self.dynamic_recovery, &windows);
                         self.windows = windows;
                     }
@@ -1310,6 +1469,14 @@ impl VeilKeyApp {
                         self.state.status = error;
                     }
                 }
+            }
+            #[cfg(target_os = "windows")]
+            if !self_visibility_targets.is_empty() {
+                self.wake_for_hidden_viewport.store(
+                    self.tray_hidden
+                        || main_window_is_logically_hidden(&self.self_hidden_window_ids),
+                    Ordering::Release,
+                );
             }
         }
         if !self.action_in_flight
@@ -1338,8 +1505,8 @@ impl VeilKeyApp {
                 // cannot be recreated without its event forwarding channel.
                 self.state.status =
                     "Windows hotkey thread is unavailable; restart VeilKey to retry.".into();
+                return;
             }
-            return;
         }
         #[cfg(not(target_os = "windows"))]
         if self.hotkeys.is_none() {
@@ -1372,24 +1539,13 @@ impl VeilKeyApp {
                 })
                 .map(|group| group.name.clone()),
         );
-        for role in self.dynamic_hotkey_roles.values() {
-            if !self.registered_hotkey_ids.contains(&role.hotkey.id) {
-                if manager.register(role.hotkey).is_ok() {
-                    self.registered_hotkey_ids.insert(role.hotkey.id);
-                } else {
-                    failed.push(format!("Dynamic shortcut {}", role.hotkey));
-                }
-            }
+        if self.state.bind_mode.is_dynamic() {
+            let _ = self.register_dynamic_hotkeys();
+            return;
         }
         self.hotkey_retry_needed = !failed.is_empty();
         if failed.is_empty() {
             self.state.status = "Shortcuts recovered.".into();
-        }
-        if self.state.bind_mode.is_dynamic() && self.hotkey_retry_needed {
-            // Re-run the complete plan so roles that failed because another
-            // process temporarily owned a combination can join later, while
-            // already registered roles remain untouched.
-            let _ = self.register_dynamic_hotkeys();
         }
     }
 
@@ -1555,6 +1711,11 @@ impl VeilKeyApp {
                     focused_id,
                     &self.windows,
                 );
+            #[cfg(target_os = "windows")]
+            veilkey::platform::debug_log(format!(
+                "dynamic hotkey decision suffix={suffix:?} focused={focused_id:?} binding={binding} fullscreen={fullscreen_foreground} hidden_self_slot={slot_contains_hidden_own_window} existing_group={}",
+                self.state.dynamic_groups.contains_key(&suffix)
+            ));
             if binding {
                 let focused = match focused {
                     Ok(Some(id)) => id,
@@ -1637,19 +1798,28 @@ impl VeilKeyApp {
         }
     }
 
-    fn activate_dynamic_hotkey(&mut self, role: DynamicHotkeyRole) {
+    fn activate_dynamic_hotkey(
+        &mut self,
+        role: DynamicHotkeyRole,
+        foreground_handle: Option<isize>,
+    ) {
         if self.dynamic_toggle_in_flight || self.action_in_flight {
             if self.pending_dynamic_toggles.len() < 16 {
-                self.pending_dynamic_toggles.push_back(role);
+                self.pending_dynamic_toggles
+                    .push_back((role, foreground_handle));
             } else {
                 self.state.status = "Too many window shortcuts are queued.".into();
             }
             return;
         }
-        self.start_dynamic_hotkey_lookup(role);
+        self.start_dynamic_hotkey_lookup(role, foreground_handle);
     }
 
-    fn start_dynamic_hotkey_lookup(&mut self, role: DynamicHotkeyRole) {
+    fn start_dynamic_hotkey_lookup(
+        &mut self,
+        role: DynamicHotkeyRole,
+        foreground_handle: Option<isize>,
+    ) {
         let previous_window_ids: Vec<String> = self
             .state
             .dynamic_groups
@@ -1662,6 +1832,7 @@ impl VeilKeyApp {
             role.suffix,
             previous_window_ids,
             self_hidden_window_ids,
+            foreground_handle,
         )) {
             Ok(()) => self.dynamic_toggle_in_flight = true,
             Err(mpsc::TrySendError::Full(_)) => {
@@ -1677,8 +1848,8 @@ impl VeilKeyApp {
         if self.is_exit_requested() || self.dynamic_toggle_in_flight || self.action_in_flight {
             return;
         }
-        if let Some(role) = self.pending_dynamic_toggles.pop_front() {
-            self.start_dynamic_hotkey_lookup(role);
+        if let Some((role, foreground_handle)) = self.pending_dynamic_toggles.pop_front() {
+            self.start_dynamic_hotkey_lookup(role, foreground_handle);
         }
     }
 
@@ -1783,7 +1954,11 @@ impl VeilKeyApp {
         }
         let mut group_to_toggle = None;
         let mut dynamic_toggle = None;
-        while let Ok(event) = self.hotkey_event_rx.try_recv() {
+        while let Ok(input) = self.hotkey_event_rx.try_recv() {
+            #[cfg(target_os = "windows")]
+            let (event, foreground_handle) = (input.event, Some(input.foreground_handle));
+            #[cfg(not(target_os = "windows"))]
+            let (event, foreground_handle) = (input, None);
             #[cfg(target_os = "windows")]
             veilkey::platform::debug_log(format!(
                 "hotkey event id={} state={:?}",
@@ -1793,8 +1968,12 @@ impl VeilKeyApp {
             if event.state() != HotKeyState::Pressed {
                 continue;
             }
+            #[cfg(target_os = "windows")]
+            if input.woke_hidden_viewport {
+                self.viewport_hidden = false;
+            }
             if let Some(role) = self.dynamic_hotkey_roles.get(&event.id()).cloned() {
-                dynamic_toggle = Some(role);
+                dynamic_toggle = Some((role, foreground_handle));
                 break;
             }
             group_to_toggle = self.state.groups.iter().position(|group| {
@@ -1808,8 +1987,8 @@ impl VeilKeyApp {
                 break;
             }
         }
-        if let Some(role) = dynamic_toggle {
-            self.activate_dynamic_hotkey(role);
+        if let Some((role, foreground_handle)) = dynamic_toggle {
+            self.activate_dynamic_hotkey(role, foreground_handle);
         } else if let Some(index) = group_to_toggle {
             self.toggle_group(index);
         }
@@ -1857,6 +2036,12 @@ impl VeilKeyApp {
             match command {
                 TrayCommand::Show => {
                     self.viewport_hidden = false;
+                    #[cfg(target_os = "windows")]
+                    {
+                        self.tray_hidden = false;
+                        self.wake_for_hidden_viewport
+                            .store(false, Ordering::Release);
+                    }
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -2244,6 +2429,29 @@ impl VeilKeyApp {
         self.preview_pixels
             .retain(|window_id, _| live_ids.contains(window_id.as_str()));
     }
+
+    #[cfg(target_os = "windows")]
+    fn sync_hidden_viewport(&mut self, ctx: &egui::Context) {
+        if self.action_in_flight
+            || self.dynamic_toggle_in_flight
+            || !self.pending_dynamic_toggles.is_empty()
+            || !self.queued_toggles.is_empty()
+            || self.on_exit_requested()
+        {
+            return;
+        }
+        let should_hide =
+            self.tray_hidden || main_window_is_logically_hidden(&self.self_hidden_window_ids);
+        self.wake_for_hidden_viewport
+            .store(should_hide, Ordering::Release);
+        if let Some(visible) = viewport_visibility_command(self.viewport_hidden, should_hide) {
+            self.viewport_hidden = should_hide;
+            veilkey::platform::debug_log(format!(
+                "viewport visibility transition visible={visible}"
+            ));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+        }
+    }
 }
 
 impl eframe::App for VeilKeyApp {
@@ -2278,6 +2486,11 @@ impl eframe::App for VeilKeyApp {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
             self.viewport_hidden = true;
+            #[cfg(target_os = "windows")]
+            {
+                self.tray_hidden = true;
+                self.wake_for_hidden_viewport.store(true, Ordering::Release);
+            }
         }
         self.update_window_snapshot();
         self.update_window_actions();
@@ -2287,14 +2500,14 @@ impl eframe::App for VeilKeyApp {
         self.complete_focused_window_bindings(self.state.english_ui);
         self.capture_hotkey(ctx);
         self.handle_hotkey_events();
-        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        #[cfg(target_os = "macos")]
         if self.viewport_hidden && !self.on_exit_requested() {
-            // The Windows hotkey bridge temporarily wakes the native viewport.
-            // Preserve the tray-hidden state after this frame handles the event.
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         self.process_dynamic_toggle_results(self.state.english_ui);
         self.start_next_dynamic_toggle();
+        #[cfg(target_os = "windows")]
+        self.sync_hidden_viewport(ctx);
         self.sync_preview_textures(ctx);
         // GlobalHotKey exposes a receiver instead of a UI wake callback. Poll it
         // frequently on Windows so shortcut latency stays below a display frame.
@@ -2387,11 +2600,6 @@ impl eframe::App for VeilKeyApp {
                     ui.label(
                         egui::RichText::new(tr(english, "No groups yet", "还没有窗口组")).strong(),
                     );
-                    ui.label(tr(
-                        english,
-                        "Select windows on the right to get started.",
-                        "先在右侧选择要绑定的窗口。",
-                    ));
                 }
                 let mut toggle = None;
                 let mut delete = None;
@@ -2404,12 +2612,6 @@ impl eframe::App for VeilKeyApp {
                             ui.label(egui::RichText::new(&group.name).strong());
                             ui.label(egui::RichText::new(group.hotkey.as_deref()
                                 .unwrap_or(tr(english, "Unassigned", "未绑定快捷键"))).monospace());
-                            for id in &group.window_ids {
-                                ui.label(self.windows.iter().find(|w| &w.id == id)
-                                    .map(|w| format!("{} · {}", w.app, w.title))
-                                    .unwrap_or_else(|| id.split('\0').take(2)
-                                        .collect::<Vec<_>>().join(" · ")));
-                            }
                             ui.label(format!(
                                 "{} {} · {}",
                                 group.window_ids.len(),
@@ -2422,6 +2624,42 @@ impl eframe::App for VeilKeyApp {
                                     "已隐藏"
                                 }
                             ));
+                            if group.window_ids.len() > 1 {
+                                egui::CollapsingHeader::new(tr(
+                                    english,
+                                    "Windows in group",
+                                    "组内窗口",
+                                ))
+                                .id_salt(("group-windows", &group.name))
+                                .show(ui, |ui| {
+                                    for id in &group.window_ids {
+                                        ui.label(
+                                            self.windows
+                                                .iter()
+                                                .find(|window| &window.id == id)
+                                                .map(|window| {
+                                                    format!("{} · {}", window.app, window.title)
+                                                })
+                                                .unwrap_or_else(|| {
+                                                    id.split('\0')
+                                                        .take(2)
+                                                        .collect::<Vec<_>>()
+                                                        .join(" · ")
+                                                }),
+                                        );
+                                    }
+                                });
+                            } else if let Some(id) = group.window_ids.first() {
+                                ui.label(
+                                    self.windows
+                                        .iter()
+                                        .find(|window| &window.id == id)
+                                        .map(|window| format!("{} · {}", window.app, window.title))
+                                        .unwrap_or_else(|| {
+                                            id.split('\0').take(2).collect::<Vec<_>>().join(" · ")
+                                        }),
+                                );
+                            }
                         });
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             if ui.small_button(tr(english, "Remove", "移除")).clicked() {
@@ -2440,7 +2678,6 @@ impl eframe::App for VeilKeyApp {
                         });
                     });
                     ui.horizontal(|ui| {
-                        ui.label(tr(english, "Shortcut", "快捷键"));
                         ui.add(
                             egui::TextEdit::singleline(&mut group.hotkey_draft)
                                 .hint_text(tr(
@@ -2528,12 +2765,7 @@ impl eframe::App for VeilKeyApp {
                 }
 
                 let ui = &mut columns[1];
-                ui.heading(tr(english, "Available windows", "可绑定窗口"));
-                ui.label(tr(
-                    english,
-                    "Only visible windows with a usable preview are listed.",
-                    "这里只显示当前可见且有实际尺寸的窗口。",
-                ));
+                ui.heading(tr(english, "Windows", "窗口"));
                 #[cfg(target_os = "macos")]
                 if !NativeWindowController::screen_capture_authorized() {
                     ui.horizontal(|ui| {
@@ -2569,7 +2801,6 @@ impl eframe::App for VeilKeyApp {
                 }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    ui.label(tr(english, "Name", "组名"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.state.new_group_name)
                             .hint_text(tr(english, "e.g. MuMu set", "例如：MuMu 多开"))
@@ -2577,11 +2808,23 @@ impl eframe::App for VeilKeyApp {
                     );
                 });
                 ui.add_space(6.0);
-                if self.state.bind_mode == BindMode::SelectFromList
-                    && ui
-                        .button(tr(english, "Create group", "创建窗口组"))
-                        .clicked()
-                {
+                let selected_window_count = self.state.selected_windows.len();
+                if self.state.bind_mode == BindMode::SelectFromList {
+                    ui.horizontal(|ui| {
+                        ui.label(if english {
+                            format!("{selected_window_count} selected")
+                        } else {
+                            format!("已选择 {selected_window_count} 个窗口")
+                        });
+                        let can_create = selected_window_count > 0
+                            && !self.state.new_group_name.trim().is_empty();
+                        if ui
+                            .add_enabled(
+                                can_create,
+                                egui::Button::new(tr(english, "Create group", "创建窗口组")),
+                            )
+                            .clicked()
+                        {
                     if self
                         .state
                         .create_group(self.state.new_group_name.trim().to_owned())
@@ -2601,10 +2844,11 @@ impl eframe::App for VeilKeyApp {
                         )
                         .into();
                     }
+                        }
+                    });
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.label(tr(english, "Search", "搜索"));
                     ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .hint_text(tr(english, "App or window name", "应用或窗口名称"))
@@ -2843,6 +3087,60 @@ mod tests {
         preserve_logically_hidden_windows(&mut windows, &hidden);
 
         assert!(!windows[0].visible);
+    }
+
+    #[test]
+    fn viewport_visibility_commands_only_run_on_state_transitions() {
+        assert_eq!(viewport_visibility_command(true, true), None);
+        assert_eq!(viewport_visibility_command(false, false), None);
+        assert_eq!(viewport_visibility_command(false, true), Some(false));
+        assert_eq!(viewport_visibility_command(true, false), Some(true));
+
+        // A native hotkey wake changes the observed state before the UI
+        // finishes the window action; completion can then hide the viewport once.
+        let awakened = false;
+        assert_eq!(viewport_visibility_command(awakened, true), Some(false));
+    }
+
+    #[test]
+    fn self_window_state_is_reconciled_from_the_native_visibility_snapshot() {
+        let id = format!(
+            "veilkey.exe\0VeilKey\00|hwnd:1234|pid:{}",
+            std::process::id()
+        );
+        let mut hidden_ids = HashSet::new();
+        let mut window = WindowInfo {
+            id: id.clone(),
+            title: "VeilKey".into(),
+            app: "veilkey.exe".into(),
+            rect: veilkey::Rect {
+                x: 10,
+                y: 20,
+                width: 800,
+                height: 600,
+            },
+            visible: false,
+            native_handle: 0x1234,
+            process_id: std::process::id(),
+            preview: None,
+        };
+
+        reconcile_self_hidden_windows(
+            std::slice::from_ref(&window),
+            &mut hidden_ids,
+            &[(id.clone(), false)],
+        );
+        assert!(hidden_ids.contains(&id));
+
+        // A native wake temporarily makes the HWND visible while another
+        // shortcut is being processed. That unrelated snapshot must not clear
+        // the logical hidden state.
+        window.visible = true;
+        reconcile_self_hidden_windows(&[window.clone()], &mut hidden_ids, &[]);
+        assert!(hidden_ids.contains(&id));
+
+        reconcile_self_hidden_windows(&[window], &mut hidden_ids, &[(id, true)]);
+        assert!(hidden_ids.is_empty());
     }
 
     #[test]
@@ -3093,7 +3391,7 @@ mod tests {
             process_id: 11,
             preview: None,
         }];
-        assert!(should_bind_slot(
+        assert!(!should_bind_slot(
             Some(&first),
             Some("other-app"),
             &[windows.first().unwrap().clone(), other_app[0].clone()]
@@ -3155,7 +3453,7 @@ mod tests {
     }
 
     #[test]
-    fn switching_from_hidden_slot_restores_old_and_hides_new_target() {
+    fn unrelated_foreground_after_hide_toggles_saved_slot_instead_of_rebinding() {
         let mut old = group("Old target", "super+Digit9");
         old.window_ids.insert("old".into());
         old.is_visible = false;
@@ -3183,18 +3481,31 @@ mod tests {
             new.clone(),
         ];
 
-        assert!(should_bind_slot(Some(&old), Some("new"), &windows));
-        let mut actions = restore_group_actions(&old, &windows);
-        let mut replacement = group("New target", "super+Digit9");
-        replacement.window_ids.insert("new".into());
-        actions.extend(slot_actions(&mut replacement, &windows));
+        assert!(!should_bind_slot(Some(&old), Some("new"), &windows));
+        let actions = slot_actions(&mut old, &windows);
         assert!(matches!(
             actions.as_slice(),
-            [
-                WindowAction::SetVisible { window_id: old_id, visible: true, .. },
-                WindowAction::SetVisible { window_id: new_id, visible: false, .. }
-            ] if old_id == "old" && new_id == "new"
+            [WindowAction::SetVisible { window_id, visible: true, .. }]
+                if window_id == "old"
         ));
+        assert!(old.is_visible);
+    }
+
+    #[test]
+    fn dynamic_registration_status_reports_partial_and_total_conflicts() {
+        assert_eq!(dynamic_registration_status(0, 0, false), "");
+        assert_eq!(
+            dynamic_registration_status(4, 4, false),
+            "Dynamic shortcut ranges registered."
+        );
+        assert_eq!(
+            dynamic_registration_status(2, 4, true),
+            "Shortcut range partially registered: 2/4 shortcuts are available."
+        );
+        assert!(
+            dynamic_registration_status(0, 4, true)
+                .starts_with("No dynamic shortcuts are currently available;")
+        );
     }
 
     #[test]

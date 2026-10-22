@@ -3,9 +3,17 @@ use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::thread;
 use std::time::Duration;
+use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
 use windows::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, MSG, PM_REMOVE, PeekMessageW, TranslateMessage,
 };
+
+#[derive(Clone, Copy, Debug)]
+pub struct HotkeyEvent {
+    pub event: global_hotkey::GlobalHotKeyEvent,
+    pub foreground_handle: isize,
+    pub woke_hidden_viewport: bool,
+}
 
 enum Command {
     Register(HotKey, SyncSender<Result<(), String>>),
@@ -17,7 +25,7 @@ pub struct HotkeyManager {
 }
 
 impl HotkeyManager {
-    pub fn new(events: Sender<global_hotkey::GlobalHotKeyEvent>) -> Result<Self, String> {
+    pub fn new(events: Sender<HotkeyEvent>) -> Result<Self, String> {
         let (commands, requests) = mpsc::sync_channel(128);
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         thread::Builder::new()
@@ -61,7 +69,7 @@ enum CommandKind {
 fn run_message_thread(
     requests: Receiver<Command>,
     ready: SyncSender<Result<(), String>>,
-    events: Sender<global_hotkey::GlobalHotKeyEvent>,
+    events: Sender<HotkeyEvent>,
 ) {
     let manager = match GlobalHotKeyManager::new() {
         Ok(manager) => {
@@ -99,12 +107,21 @@ fn run_message_thread(
             }
         }
         while let Ok(event) = receiver.try_recv() {
+            let foreground_handle = unsafe { GetForegroundWindow().0 as isize };
             veilkey::platform::debug_log(format!(
-                "message thread forwarded hotkey id={} state={:?}",
+                "message thread forwarded hotkey id={} state={:?} foreground=0x{:x}",
                 event.id(),
-                event.state()
+                event.state(),
+                foreground_handle
             ));
-            if events.send(event).is_err() {
+            if events
+                .send(HotkeyEvent {
+                    event,
+                    foreground_handle,
+                    woke_hidden_viewport: false,
+                })
+                .is_err()
+            {
                 return;
             }
         }

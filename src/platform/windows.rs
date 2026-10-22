@@ -15,15 +15,57 @@ use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowPlacement,
-    GetWindowRect, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, HWND_NOTOPMOST,
-    HWND_TOP, HWND_TOPMOST, IsIconic, IsWindow, IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SetForegroundWindow, SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT,
-    WS_EX_TOOLWINDOW,
+    EnumWindows, GWL_EXSTYLE, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
+    GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+    GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, IsWindow,
+    IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPlacement,
+    SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
+pub fn foreground_window_handle() -> isize {
+    unsafe { GetForegroundWindow().0 as isize }
+}
+
+fn focused_window_id_for_handle(
+    windows: &[WindowInfo],
+    foreground_handle: isize,
+) -> Option<String> {
+    (foreground_handle != 0)
+        .then(|| {
+            windows
+                .iter()
+                .find(|window| window.native_handle == foreground_handle)
+                .map(|window| window.id.clone())
+        })
+        .flatten()
+}
+
+fn is_desktop_or_shell_handle(handle: HWND) -> bool {
+    unsafe { is_desktop_or_shell_handle_from(handle, GetDesktopWindow(), GetShellWindow()) }
+}
+
+fn is_desktop_or_shell_handle_from(handle: HWND, desktop: HWND, shell: HWND) -> bool {
+    handle == desktop || handle == shell
+}
+
 const LOG_LIMIT: u64 = 2 * 1024 * 1024;
+
+fn validate_main_window_enumeration(
+    result: windows::core::Result<()>,
+    target_found: bool,
+    process_id: u32,
+) -> Result<(), String> {
+    if target_found {
+        return Ok(());
+    }
+    match result {
+        Err(error) => Err(format!("Could not enumerate VeilKey's own window: {error}")),
+        Ok(()) => Err(format!(
+            "No VeilKey main window was found for process {process_id}."
+        )),
+    }
+}
 
 pub fn debug_log(message: impl AsRef<str>) {
     let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") else {
@@ -67,19 +109,17 @@ pub fn wake_main_window() -> Result<isize, String> {
         }
     }
 
-    unsafe {
+    // EnumWindows reports ERROR_CANCELLED when a callback returns FALSE to
+    // stop enumeration. We intentionally do that as soon as our window is
+    // found, so only treat the API result as an error when no target was set.
+    let enumeration_result = unsafe {
         EnumWindows(
             Some(find_main_window),
             LPARAM(&mut state as *mut _ as isize),
         )
-        .map_err(|error| format!("Could not enumerate VeilKey's own window: {error}"))?;
-    }
+    };
     let target = state.1;
-    if target.0.is_null() {
-        return Err(format!(
-            "No VeilKey main window was found for process {current_pid}."
-        ));
-    }
+    validate_main_window_enumeration(enumeration_result, !target.0.is_null(), current_pid)?;
     // The BOOL return value reports the previous visibility state; FALSE is
     // expected for the hidden-window case and does not mean the request failed.
     let was_visible = unsafe { ShowWindowAsync(target, SW_SHOWNOACTIVATE) }.as_bool();
@@ -145,7 +185,16 @@ impl NativeWindowController {
     pub fn focused_window_snapshot(
         logically_hidden_window_ids: &[String],
     ) -> Result<(Option<String>, Vec<WindowInfo>), String> {
-        let foreground = unsafe { GetForegroundWindow() };
+        Self::focused_window_snapshot_for_handle(
+            foreground_window_handle(),
+            logically_hidden_window_ids,
+        )
+    }
+
+    pub fn focused_window_snapshot_for_handle(
+        foreground_handle: isize,
+        logically_hidden_window_ids: &[String],
+    ) -> Result<(Option<String>, Vec<WindowInfo>), String> {
         let mut windows = Self::enumerate_fast()?;
         for window in &mut windows {
             if logically_hidden_window_ids
@@ -155,14 +204,11 @@ impl NativeWindowController {
                 window.visible = false;
             }
         }
-        let focused = (!foreground.0.is_null())
-            .then(|| {
-                windows
-                    .iter()
-                    .find(|window| window.native_handle == foreground.0 as isize)
-                    .map(|window| window.id.clone())
-            })
-            .flatten();
+        let focused = if is_desktop_or_shell_handle(HWND(foreground_handle as *mut _)) {
+            None
+        } else {
+            focused_window_id_for_handle(&windows, foreground_handle)
+        };
         Ok((focused, windows))
     }
 
@@ -181,6 +227,9 @@ impl NativeWindowController {
     pub fn foreground_window_id() -> Result<Option<String>, String> {
         let foreground = unsafe { GetForegroundWindow() };
         if foreground.0.is_null() {
+            return Ok(None);
+        }
+        if is_desktop_or_shell_handle(foreground) {
             return Ok(None);
         }
         Ok(Self::enumerate()?
@@ -310,6 +359,7 @@ impl NativeWindowController {
             })
             .collect();
         let mut errors = Vec::new();
+        let mut pending_visibility = Vec::new();
         for action in actions {
             let (window_id, handle) = match &action {
                 WindowAction::SetVisible {
@@ -318,6 +368,10 @@ impl NativeWindowController {
                 | WindowAction::SetRect {
                     window_id, handle, ..
                 } => (window_id.as_str(), *handle),
+            };
+            let requested_visibility = match &action {
+                WindowAction::SetVisible { visible, .. } => Some(*visible),
+                WindowAction::SetRect { .. } => None,
             };
             let hwnd = HWND(handle as *mut core::ffi::c_void);
             debug_log(format!("action window_id={window_id:?} hwnd=0x{handle:x}"));
@@ -356,9 +410,8 @@ impl NativeWindowController {
                                 flags,
                             )
                             .map_err(|e| e.to_string())
-                            .and_then(|()| {
+                            .map(|()| {
                                 refresh_window_surface(hwnd);
-                                verify_window_still_exists(hwnd)
                             })
                         } else if force_popup {
                             SetWindowPos(
@@ -375,16 +428,15 @@ impl NativeWindowController {
                                     | SWP_NOOWNERZORDER,
                             )
                             .map_err(|e| e.to_string())
-                            .and_then(|()| {
+                            .map(|()| {
                                 refresh_window_surface(hwnd);
-                                verify_window_still_exists(hwnd)
                             })
                         } else {
                             // Do not touch z-order for the default game-friendly path.
                             // ShowWindowAsync returns the previous visibility state, not success.
                             let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
                             refresh_window_surface(hwnd);
-                            verify_window_still_exists(hwnd)
+                            Ok(())
                         }
                     } else {
                         let z_order_result = if force_popup {
@@ -403,7 +455,7 @@ impl NativeWindowController {
                         };
                         // ShowWindowAsync returns the previous visibility state, not success.
                         let _ = ShowWindowAsync(hwnd, SW_HIDE);
-                        let hide_result = verify_window_still_exists(hwnd);
+                        let hide_result = Ok(());
                         match (z_order_result, hide_result) {
                             (Ok(()), result) | (result, Ok(())) => result,
                             (Err(z_order_error), Err(hide_error)) => Err(format!(
@@ -454,9 +506,32 @@ impl NativeWindowController {
                 ));
                 errors.push(format!("{window_title}: {error}"));
             } else {
-                debug_log(format!(
-                    "action completed title={window_title:?} hwnd=0x{handle:x}"
-                ));
+                if let Some(expected) = requested_visibility {
+                    pending_visibility.push((hwnd, expected, window_title, handle));
+                } else {
+                    debug_log(format!(
+                        "action completed title={window_title:?} hwnd=0x{handle:x}"
+                    ));
+                }
+            }
+        }
+        // Dispatch every member of the group before waiting for individual
+        // windows. This makes a group appear or disappear as one coherent
+        // operation instead of visibly stepping through each window.
+        for (hwnd, expected, window_title, handle) in pending_visibility {
+            match wait_for_visibility(hwnd, expected) {
+                Ok(()) => {
+                    let observed = unsafe { IsWindowVisible(hwnd).as_bool() };
+                    debug_log(format!(
+                        "action completed title={window_title:?} hwnd=0x{handle:x} requested_visible={expected} observed_visible={observed}"
+                    ));
+                }
+                Err(error) => {
+                    debug_log(format!(
+                        "action failed title={window_title:?} hwnd=0x{handle:x}: {error}"
+                    ));
+                    errors.push(format!("{window_title}: {error}"));
+                }
             }
         }
         // When hiding windows behind a game, restore the already-focused foreground app only
@@ -530,11 +605,22 @@ fn window_title(hwnd: HWND) -> Option<String> {
     }
 }
 
-fn verify_window_still_exists(hwnd: HWND) -> Result<(), String> {
-    if unsafe { IsWindow(hwnd).as_bool() } {
-        Ok(())
-    } else {
-        Err("Window closed while its visibility change was being requested.".into())
+fn wait_for_visibility(hwnd: HWND, expected: bool) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        if !unsafe { IsWindow(hwnd).as_bool() } {
+            return Err("Window closed while its visibility change was pending.".into());
+        }
+        let visible = unsafe { IsWindowVisible(hwnd).as_bool() };
+        if visible == expected {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "Window visibility did not become {expected} within 500 ms (still {visible})."
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -652,6 +738,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn stopping_window_enumeration_after_finding_target_is_success() {
+        // A callback returning FALSE can leave EnumWindows reporting a stale
+        // last-error value. The found HWND is authoritative in that case.
+        let stopped_early = Err(windows::core::Error::from_win32());
+        assert!(validate_main_window_enumeration(stopped_early, true, 42).is_ok());
+    }
+
+    #[test]
+    fn missing_main_window_preserves_enumeration_error() {
+        let error = windows::core::Error::from_win32();
+        let message = error.to_string();
+        let result = validate_main_window_enumeration(Err(error), false, 42);
+        assert_eq!(
+            result.expect_err("missing window must fail"),
+            format!("Could not enumerate VeilKey's own window: {message}")
+        );
+    }
+
+    #[test]
     fn repeated_desktop_enumeration_returns_unique_window_identities() {
         for _ in 0..200 {
             let windows = NativeWindowController::enumerate().expect("enumerate desktop windows");
@@ -696,5 +801,53 @@ mod tests {
         );
         assert_eq!(expected_process_id("app.exe\\0title\\00|hwnd:1a2b"), None);
         assert_eq!(expected_process_id("app.exe\\0title\\00"), None);
+    }
+
+    #[test]
+    fn foreground_snapshot_uses_hotkey_time_handle_after_veilkey_wake() {
+        let windows = vec![
+            WindowInfo {
+                id: "files\\0release|hwnd:10|pid:2".into(),
+                title: "release".into(),
+                app: "files.exe".into(),
+                rect: Default::default(),
+                visible: true,
+                native_handle: 10,
+                process_id: 2,
+                preview: None,
+            },
+            WindowInfo {
+                id: "veilkey\\0VeilKey|hwnd:20|pid:1".into(),
+                title: "VeilKey".into(),
+                app: "veilkey.exe".into(),
+                rect: Default::default(),
+                visible: true,
+                native_handle: 20,
+                process_id: 1,
+                preview: None,
+            },
+        ];
+        assert_eq!(
+            focused_window_id_for_handle(&windows, 10),
+            Some(windows[0].id.clone())
+        );
+        assert_eq!(
+            focused_window_id_for_handle(&windows, 20),
+            Some(windows[1].id.clone())
+        );
+        assert_eq!(focused_window_id_for_handle(&windows, 0), None);
+    }
+
+    #[test]
+    fn desktop_and_shell_handles_are_never_dynamic_binding_targets() {
+        let desktop = HWND(10 as *mut _);
+        let shell = HWND(20 as *mut _);
+        assert!(is_desktop_or_shell_handle_from(desktop, desktop, shell));
+        assert!(is_desktop_or_shell_handle_from(shell, desktop, shell));
+        assert!(!is_desktop_or_shell_handle_from(
+            HWND(30 as *mut _),
+            desktop,
+            shell
+        ));
     }
 }

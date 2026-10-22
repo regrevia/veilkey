@@ -598,6 +598,28 @@ mod tests {
     }
 
     #[test]
+    fn multi_window_group_keeps_every_selected_window() {
+        let mut state = AppState::default();
+        let windows = [
+            sample_window("mumu-1", 1, 0),
+            sample_window("mumu-2", 2, 800),
+            sample_window("mumu-3", 3, 1600),
+            sample_window("mumu-4", 4, 2400),
+        ];
+        state
+            .selected_windows
+            .extend(windows.iter().map(|window| window.id.clone()));
+
+        assert!(state.create_group("MuMu set".into()));
+        assert_eq!(state.groups[0].window_ids.len(), windows.len());
+        assert!(
+            windows
+                .iter()
+                .all(|window| state.groups[0].window_ids.contains(&window.id))
+        );
+    }
+
+    #[test]
     fn partial_hide_retry_preserves_geometry_of_windows_already_hidden() {
         let mut state = AppState::default();
         state.selected_windows.extend(["a".into(), "b".into()]);

@@ -1,5 +1,6 @@
-## Unreleased
+## 0.2.26 - 2026-10-22
 
+- Treat closing the main window with X as a graceful app exit that restores bound windows; keep background shortcuts active only when the user explicitly hides VeilKey to the tray.
 - Add multi-window groups with one global shortcut, including selection count feedback and collapsible group members.
 - Keep hidden VeilKey window state stable while global shortcuts wake the native viewport, avoiding repeated visibility commands that can produce black frames.
 - Preserve the foreground application during Windows group operations and refresh GPU-backed window surfaces without erasing their contents.

@@ -1014,6 +1014,8 @@ impl VeilKeyApp {
         #[cfg(target_os = "windows")]
         let wake_for_hidden_viewport = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
+        let exit_requested_for_hotkeys = Arc::clone(&exit_requested);
+        #[cfg(target_os = "windows")]
         let hotkeys = HotkeyManager::new(raw_hotkey_tx).ok();
         #[cfg(target_os = "windows")]
         {
@@ -1023,7 +1025,8 @@ impl VeilKeyApp {
                 while let Ok(mut hotkey) = raw_hotkey_rx.recv() {
                     let event = hotkey.event;
                     let needs_native_wake = event.state() == HotKeyState::Pressed
-                        && wake_required.load(Ordering::Acquire);
+                        && wake_required.load(Ordering::Acquire)
+                        && !exit_requested_for_hotkeys.load(Ordering::Acquire);
                     hotkey.woke_hidden_viewport = needs_native_wake;
                     veilkey::platform::debug_log(format!(
                         "hotkey event forwarded id={} state={:?} foreground=0x{:x} viewport_hidden={needs_native_wake}",
@@ -2479,18 +2482,18 @@ impl eframe::App for VeilKeyApp {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.process_tray_commands(ctx);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        if ctx.input(|input| input.viewport().close_requested())
-            && self.tray_icon.is_some()
-            && !self.on_exit_requested()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
-            self.viewport_hidden = true;
+        if ctx.input(|input| input.viewport().close_requested()) && !self.on_exit_requested() {
             #[cfg(target_os = "windows")]
-            {
-                self.tray_hidden = true;
-                self.wake_for_hidden_viewport.store(true, Ordering::Release);
-            }
+            veilkey::platform::debug_log("main window close requested; beginning graceful exit");
+            // Closing with X means exit. The tray can still hide VeilKey
+            // intentionally; closing the last UI surface should never leave
+            // its global shortcuts active in the background.
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.capture_armed.store(false, Ordering::Release);
+            self.queued_toggles.clear();
+            self.pending_dynamic_toggles.clear();
+            self.exit_requested.store(true, Ordering::Release);
+            ctx.request_repaint();
         }
         self.update_window_snapshot();
         self.update_window_actions();

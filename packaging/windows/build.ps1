@@ -16,9 +16,13 @@ if ([string]::IsNullOrWhiteSpace($Version)) {
     $Version = $versionMatch.Matches.Groups[1].Value
 }
 
-$binaryPath = Join-Path $repositoryRoot 'target\x86_64-pc-windows-msvc\release\veilkey.exe'
+$binaryCandidates = @(
+    (Join-Path $repositoryRoot 'target\x86_64-pc-windows-msvc\release\veilkey.exe'),
+    (Join-Path $repositoryRoot 'target\release\veilkey.exe')
+)
+$binaryPath = $binaryCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
-    throw "Release executable not found at '$binaryPath'. Build the Windows MSVC release target first."
+    throw "Release executable not found. Build the Windows MSVC release target first. Checked: $($binaryCandidates -join ', ')"
 }
 
 if ([string]::IsNullOrWhiteSpace($CompilerPath)) {
@@ -52,11 +56,22 @@ if ($LASTEXITCODE -ne 0) {
     throw "Inno Setup failed with exit code $LASTEXITCODE."
 }
 
-$portablePath = Join-Path $OutputDirectory "VeilKey-$Version-windows-x64.exe"
+$portablePath = Join-Path $OutputDirectory 'VeilKey.exe'
 Copy-Item -LiteralPath $binaryPath -Destination $portablePath -Force
-$installerPath = Join-Path $OutputDirectory "VeilKey-Setup-$Version-windows-x64.exe"
+$installerPath = Join-Path $OutputDirectory 'VeilKey-Setup.exe'
 if (-not (Test-Path -LiteralPath $installerPath -PathType Leaf)) {
     throw "Inno Setup completed without producing '$installerPath'."
 }
 
+$sourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $binaryPath).Hash
+$portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portablePath).Hash
+if ($portableHash -ne $sourceHash) {
+    throw 'Portable executable differs from the release build.'
+}
+$installerItem = Get-Item -LiteralPath $installerPath
+$smokeTest = Join-Path $PSScriptRoot 'smoke-test-installer.ps1'
+& $smokeTest -InstallerPath $installerItem.FullName -ExpectedExecutableSha256 $sourceHash
+if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+    throw "Installer smoke test failed with exit code $LASTEXITCODE."
+}
 Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath, $portablePath

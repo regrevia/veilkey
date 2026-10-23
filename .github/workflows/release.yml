@@ -47,12 +47,17 @@ jobs:
         run: |
           New-Item -ItemType Directory -Force -Path 'packaging/output' | Out-Null
           & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$((Get-Location).Path)" "/DBinaryPath=$((Get-Location).Path)\target\x86_64-pc-windows-msvc\release\veilkey.exe" 'packaging/windows/veilkey.iss'
-          Copy-Item 'target/x86_64-pc-windows-msvc/release/veilkey.exe' "packaging/output/VeilKey-${{ steps.version.outputs.version }}-windows-x64.exe"
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/veilkey.exe' 'packaging/output/VeilKey.exe'
+          $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath 'packaging/output/VeilKey.exe').Hash
+          $installedSourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath 'target/x86_64-pc-windows-msvc/release/veilkey.exe').Hash
+          if ($portableHash -ne $installedSourceHash) { throw 'Portable executable differs from the release build.' }
+          $installer = Get-Item 'packaging/output/VeilKey-Setup.exe'
+          .\packaging\windows\smoke-test-installer.ps1 -InstallerPath $installer.FullName -ExpectedExecutableSha256 $portableHash
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            packaging/output/VeilKey-${{ steps.version.outputs.version }}-windows-x64.exe
-            packaging/windows/VeilKey-Setup-${{ steps.version.outputs.version }}-windows-x64.exe
+            packaging/output/VeilKey.exe
+            packaging/output/VeilKey-Setup.exe
 
   macos:
     needs: verify

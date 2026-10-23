@@ -25,7 +25,7 @@ PrivilegesRequired=lowest
 CloseApplications=no
 RestartApplications=no
 OutputDir=.
-OutputBaseFilename=VeilKey-Setup-{#AppVersion}-windows-x64
+OutputBaseFilename=VeilKey-Setup
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -35,7 +35,7 @@ ArchitecturesAllowed=x64
 LicenseFile={#SourceDir}\LICENSE
 
 [Languages]
-Name: "english"; MessagesFile: "compiler:Default.isl"
+Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 
 [Files]
 Source: "{#BinaryPath}"; DestDir: "{app}"; Flags: ignoreversion
@@ -45,7 +45,7 @@ Name: "{group}\VeilKey"; Filename: "{app}\veilkey.exe"
 Name: "{autodesktop}\VeilKey"; Filename: "{app}\veilkey.exe"; Tasks: desktopicon
 
 [Tasks]
-Name: "desktopicon"; Description: "Create a desktop shortcut"; GroupDescription: "Additional shortcuts:"
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项："; Flags: unchecked
 
 [Run]
 Filename: "{app}\veilkey.exe"; Description: "Launch VeilKey"; Flags: nowait postinstall skipifsilent

@@ -35,9 +35,9 @@ jobs:
         shell: pwsh
         run: |
           $version = (Select-String -Path 'Cargo.toml' -Pattern '^version\s*=\s*"([^"]+)"').Matches.Groups[1].Value
-          $portable = Get-Item "packaging/output/VeilKey-$version-windows-x64.exe"
+          $portable = Get-Item 'packaging/output/VeilKey.exe'
           $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portable.FullName).Hash
-          $installer = Get-Item "packaging/output/VeilKey-Setup-$version-windows-x64.exe"
+          $installer = Get-Item 'packaging/output/VeilKey-Setup.exe'
           .\packaging\windows\smoke-test-installer.ps1 -InstallerPath $installer.FullName -ExpectedExecutableSha256 $hash
       - name: Prepare preview release metadata
         id: release
@@ -59,8 +59,8 @@ jobs:
           generate_release_notes: false
           fail_on_unmatched_files: true
           files: |
-            packaging/output/VeilKey-Setup-${{ steps.release.outputs.version }}-windows-x64.exe
-            packaging/output/VeilKey-${{ steps.release.outputs.version }}-windows-x64.exe
+            packaging/output/VeilKey-Setup.exe
+            packaging/output/VeilKey.exe
       - name: Keep only the latest 10 Windows preview releases
         shell: pwsh
         env:

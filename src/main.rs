@@ -8,7 +8,7 @@ use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::HotKeyState;
 use global_hotkey::hotkey::HotKey;
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -772,6 +772,29 @@ fn restore_group_actions(group: &Group, windows: &[WindowInfo]) -> Vec<WindowAct
     actions
 }
 
+#[cfg(target_os = "windows")]
+fn recover_window_id<'a>(saved_id: &str, windows: &'a [WindowInfo]) -> Option<&'a WindowInfo> {
+    if let Some(exact) = windows.iter().find(|window| window.id == saved_id) {
+        return Some(exact);
+    }
+
+    // HWND and PID change when the target application is restarted. Match a
+    // replacement only when executable and full title identify exactly one
+    // current window; never guess between multiple same-titled windows.
+    let stable_key = |id: &str| {
+        let mut parts = id.split('\0');
+        let app = parts.next()?.to_ascii_lowercase();
+        let title = parts.next()?.to_owned();
+        Some((app, title))
+    };
+    let key = stable_key(saved_id)?;
+    let mut matches = windows
+        .iter()
+        .filter(|window| stable_key(&window.id).is_some_and(|candidate| candidate == key));
+    let matched = matches.next()?;
+    matches.next().is_none().then_some(matched)
+}
+
 fn restore_all_bound_windows(groups: &[Group], windows: &[WindowInfo]) -> Vec<WindowAction> {
     let mut actions = Vec::new();
     let mut restored_handles = HashSet::new();
@@ -952,22 +975,46 @@ impl VeilKeyApp {
                 }
             }
         }
-        let mut dynamic_recovery: Vec<Group> = std::mem::take(&mut state.dynamic_groups)
+        #[cfg(target_os = "windows")]
+        if !state.dynamic_groups.is_empty()
+            && let Ok(windows) = NativeWindowController::enumerate_fast()
+        {
+            let mut recovery_actions = Vec::new();
+            for group in state.dynamic_groups.values_mut() {
+                let mut rebound_ids = BTreeSet::new();
+                for saved_id in &group.window_ids {
+                    if let Some(window) = recover_window_id(saved_id, &windows) {
+                        rebound_ids.insert(window.id.clone());
+                    } else {
+                        // Keep unresolved identities for a future retry; a
+                        // window may start after VeilKey.
+                        rebound_ids.insert(saved_id.clone());
+                    }
+                }
+                group.window_ids = rebound_ids;
+                if !group.is_visible {
+                    recovery_actions.extend(restore_group_actions(group, &windows));
+                }
+            }
+            let _ = save_state(&state_file, &state);
+            if !recovery_actions.is_empty() {
+                match NativeWindowController::apply_actions(recovery_actions) {
+                    Ok(()) => {
+                        let _ = save_state(&state_file, &state);
+                    }
+                    Err(error) => eprintln!(
+                        "Could not restore windows from the previous VeilKey session: {error}"
+                    ),
+                }
+            }
+        }
+        #[cfg(not(target_os = "windows"))]
+        let dynamic_recovery: Vec<Group> = std::mem::take(&mut state.dynamic_groups)
             .into_values()
             .filter(|group| !group.is_visible)
             .collect();
-        if !dynamic_recovery.is_empty()
-            && let Ok(windows) = NativeWindowController::enumerate_fast()
-        {
-            let recovery_actions: Vec<_> = dynamic_recovery
-                .iter()
-                .flat_map(|group| restore_group_actions(group, &windows))
-                .collect();
-            if let Err(error) = NativeWindowController::apply_actions(recovery_actions) {
-                eprintln!("Could not restore windows from the previous VeilKey session: {error}");
-            }
-            dynamic_recovery.clear();
-        }
+        #[cfg(target_os = "windows")]
+        let dynamic_recovery: Vec<Group> = Vec::new();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let exit_requested = Arc::new(AtomicBool::new(false));
         #[cfg(target_os = "windows")]
@@ -3176,6 +3223,39 @@ fn configure_windows_cjk_fonts(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn restart_recovery_rebinds_only_a_unique_executable_and_title() {
+        let saved = "app.exe\0Player\0\0|hwnd:2a|pid:100";
+        let one = WindowInfo {
+            id: "app.exe\0Player\0\0|hwnd:91f|pid:200".into(),
+            title: "Player".into(),
+            app: "app.exe".into(),
+            rect: Default::default(),
+            visible: true,
+            native_handle: 1,
+            process_id: 200,
+            preview: None,
+        };
+        assert_eq!(
+            recover_window_id(saved, std::slice::from_ref(&one)),
+            Some(&one)
+        );
+
+        let two = WindowInfo {
+            id: "app.exe\0Player\0\x31|hwnd:920|pid:200".into(),
+            native_handle: 2,
+            ..one.clone()
+        };
+        assert!(recover_window_id(saved, &[one.clone(), two]).is_none());
+        let other_app = WindowInfo {
+            app: "other.exe".into(),
+            id: "other.exe\0Player\0\0|hwnd:91f|pid:200".into(),
+            ..one
+        };
+        assert!(recover_window_id(saved, &[other_app]).is_none());
+    }
 
     #[test]
     fn native_wake_does_not_change_the_logical_visibility_of_a_hidden_self_window() {

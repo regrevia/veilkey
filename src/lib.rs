@@ -71,7 +71,7 @@ pub struct Group {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppState {
     pub groups: Vec<Group>,
-    #[serde(default, skip)]
+    #[serde(default)]
     pub dynamic_groups: BTreeMap<String, Group>,
     #[serde(default = "default_dynamic_toggle_modifiers")]
     pub dynamic_toggle_modifiers: Vec<String>,
@@ -365,25 +365,27 @@ pub fn same_window_id(current: &str, saved: &str) -> bool {
     // Windows bindings carry a stable HWND suffix. The app/title/ordinal prefix
     // may change when a same-titled window moves and is re-sorted.
     if let Some((_, saved_handle)) = saved.rsplit_once("|hwnd:") {
-        let Some((_, current_handle)) = current.rsplit_once("|hwnd:") else {
-            return false;
-        };
-        let saved_parts: Vec<_> = saved_handle.split('|').collect();
-        let current_parts: Vec<_> = current_handle.split('|').collect();
-        if saved_parts[0] != current_parts[0] {
-            return false;
+        if let Some((_, current_handle)) = current.rsplit_once("|hwnd:") {
+            let saved_parts: Vec<_> = saved_handle.split('|').collect();
+            let current_parts: Vec<_> = current_handle.split('|').collect();
+            let saved_pid = saved_parts
+                .iter()
+                .find_map(|part| part.strip_prefix("pid:"));
+            let current_pid = current_parts
+                .iter()
+                .find_map(|part| part.strip_prefix("pid:"));
+            if saved_parts[0] == current_parts[0] {
+                return match (saved_pid, current_pid) {
+                    (Some(saved_pid), Some(current_pid)) => saved_pid == current_pid,
+                    (Some(_), None) => false,
+                    (None, _) => true,
+                };
+            }
         }
-        let saved_pid = saved_parts
-            .iter()
-            .find_map(|part| part.strip_prefix("pid:"));
-        let current_pid = current_parts
-            .iter()
-            .find_map(|part| part.strip_prefix("pid:"));
-        return match (saved_pid, current_pid) {
-            (Some(saved_pid), Some(current_pid)) => saved_pid == current_pid,
-            (Some(_), None) => false,
-            (None, _) => true,
-        };
+        // HWND and PID identify a window only for the current process session.
+        // Cross-restart recovery is handled by the Windows backend, which can
+        // safely rebind only a unique executable/title match.
+        return false;
     }
     // Keep 0.2.0/0.2.1 IDs readable while users migrate their groups.
     current.starts_with(&format!("{saved}\0"))
@@ -869,6 +871,27 @@ mod tests {
             ..sample_window("ignored", 0x2a, 500)
         }];
         assert!(state.toggle_group(0, &reused_handle).is_empty());
+    }
+
+    #[test]
+    fn dynamic_window_combinations_are_persisted_between_sessions() {
+        let mut state = AppState::default();
+        let mut group = Group {
+            name: "Player".into(),
+            window_ids: BTreeSet::from(["app.exe\0Player\0\0|hwnd:2a|pid:100".into()]),
+            hotkey: Some("Minus".into()),
+            hotkey_draft: String::new(),
+            is_visible: true,
+            force_popup: false,
+            macos_hide_application: false,
+            restore_rects: Default::default(),
+        };
+        state.dynamic_groups.insert("Minus".into(), group.clone());
+
+        let encoded = serde_json::to_vec(&state).unwrap();
+        let decoded: AppState = serde_json::from_slice(&encoded).unwrap();
+        group.hotkey_draft.clear();
+        assert_eq!(decoded.dynamic_groups.get("Minus"), Some(&group));
     }
 
     #[test]

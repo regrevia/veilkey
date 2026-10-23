@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -21,7 +22,6 @@ use veilkey::platform::NativeWindowController;
 #[cfg(target_os = "windows")]
 mod windows_hotkeys;
 #[cfg(target_os = "windows")]
-use windows_hotkeys::HotkeyEvent;
 #[cfg(target_os = "windows")]
 use windows_hotkeys::HotkeyManager;
 #[cfg(not(target_os = "windows"))]
@@ -358,6 +358,9 @@ struct VeilKeyApp {
     hotkey_retry_needed: bool,
     last_hotkey_retry: Instant,
     registered_hotkey_ids: HashSet<u32>,
+    backend_state: Arc<Mutex<AppState>>,
+    backend_updates: Receiver<AppState>,
+    #[cfg(not(target_os = "windows"))]
     hotkey_event_rx: Receiver<HotkeyEvent>,
     recording_group: Option<String>,
     capture_armed: Arc<AtomicBool>,
@@ -369,6 +372,7 @@ struct VeilKeyApp {
     focused_binding_in_flight: bool,
     pending_bind_group: Option<String>,
     dynamic_toggle_rx: Receiver<DynamicToggleLookup>,
+    #[cfg(not(target_os = "windows"))]
     dynamic_toggle_tx: mpsc::SyncSender<DynamicToggleRequest>,
     dynamic_toggle_in_flight: bool,
     pending_dynamic_toggles: VecDeque<(DynamicHotkeyRole, Option<isize>)>,
@@ -786,6 +790,101 @@ fn restore_all_bound_windows(groups: &[Group], windows: &[WindowInfo]) -> Vec<Wi
     actions
 }
 
+/// Executes a registered shortcut entirely in the resident backend. This path
+/// deliberately has no dependency on eframe repaint/update scheduling.
+#[cfg(target_os = "windows")]
+fn apply_backend_hotkey(
+    state: &mut AppState,
+    hotkey_id: u32,
+    foreground_handle: isize,
+) -> Result<bool, String> {
+    let dynamic_role = plan_dynamic_hotkeys(state)
+        .ok()
+        .and_then(|roles| roles.into_iter().find(|role| role.hotkey.id == hotkey_id));
+    let actions = if let Some(role) = dynamic_role {
+        let logically_hidden_self: Vec<String> = state
+            .groups
+            .iter()
+            .chain(state.dynamic_groups.values())
+            .filter(|group| !group.is_visible)
+            .flat_map(|group| group.window_ids.iter())
+            .filter(|id| id.contains(&format!("|pid:{}", std::process::id())))
+            .cloned()
+            .collect();
+        let (focused, windows) = NativeWindowController::focused_window_snapshot_for_handle(
+            foreground_handle,
+            &logically_hidden_self,
+        )?;
+        let focused = focused.as_deref();
+        let fullscreen =
+            focused.is_some_and(|id| NativeWindowController::is_fullscreen_window(id, &windows));
+        let hidden_self_slot = state.dynamic_groups.get(&role.suffix).is_some_and(|group| {
+            group.window_ids.iter().any(|id| {
+                logically_hidden_self
+                    .iter()
+                    .any(|hidden| veilkey::same_window_id(id, hidden))
+            })
+        });
+        let bind = !fullscreen
+            && !hidden_self_slot
+            && should_bind_slot(state.dynamic_groups.get(&role.suffix), focused, &windows);
+        if bind {
+            let focused = focused.ok_or_else(|| "No foreground window.".to_owned())?;
+            let ids = dynamic_target_ids(state.bind_mode, focused, &windows)
+                .ok_or_else(|| "Could not identify the foreground window.".to_owned())?;
+            let old = state.dynamic_groups.get(&role.suffix).cloned();
+            let mut actions = old
+                .as_ref()
+                .filter(|group| !group.is_visible)
+                .map(|group| restore_group_actions(group, &windows))
+                .unwrap_or_default();
+            for group in state.dynamic_groups.values_mut() {
+                group
+                    .window_ids
+                    .retain(|id| !ids.iter().any(|next| veilkey::same_window_id(next, id)));
+            }
+            let title = windows
+                .iter()
+                .find(|window| window.id == focused)
+                .map(|window| window.title.clone())
+                .unwrap_or_default();
+            let mut group = Group {
+                name: title,
+                window_ids: ids.into_iter().collect(),
+                hotkey: Some(role.suffix.clone()),
+                hotkey_draft: String::new(),
+                is_visible: true,
+                force_popup: false,
+                macos_hide_application: false,
+                restore_rects: Default::default(),
+            };
+            actions.extend(slot_actions(&mut group, &windows));
+            state.dynamic_groups.insert(role.suffix, group);
+            actions
+        } else if let Some(group) = state.dynamic_groups.get_mut(&role.suffix) {
+            slot_actions(group, &windows)
+        } else {
+            return Ok(false);
+        }
+    } else if let Some(index) = state.groups.iter().position(|group| {
+        group
+            .hotkey
+            .as_deref()
+            .and_then(|key| HotKey::from_str(key).ok())
+            .is_some_and(|key| key.id == hotkey_id)
+    }) {
+        let windows = NativeWindowController::enumerate_fast()?;
+        state.toggle_group(index, &windows)
+    } else {
+        return Ok(false);
+    };
+    if actions.is_empty() {
+        return Ok(false);
+    }
+    NativeWindowController::apply_actions(actions)?;
+    Ok(true)
+}
+
 fn retain_unrestored_targets(recovery: &mut Vec<Group>, windows: &[WindowInfo]) {
     for group in recovery.iter_mut() {
         group.window_ids.retain(|id| {
@@ -985,7 +1084,7 @@ impl VeilKeyApp {
         let listener_alive = Arc::clone(&capture_listener_alive);
         let (capture_tx, capture_rx) = mpsc::sync_channel(32);
         let (focused_binding_tx, focused_binding_rx) = mpsc::channel();
-        let (dynamic_toggle_tx, dynamic_toggle_requests) =
+        let (_dynamic_toggle_tx, dynamic_toggle_requests) =
             mpsc::sync_channel::<DynamicToggleRequest>(16);
         let (dynamic_toggle_results, dynamic_toggle_rx) = mpsc::channel();
         let dynamic_toggle_ctx = ctx.clone();
@@ -1025,6 +1124,9 @@ impl VeilKeyApp {
                 dynamic_toggle_ctx.request_repaint();
             }
         });
+        let backend_state = Arc::new(Mutex::new(state.clone()));
+        let (backend_update_tx, backend_updates) = mpsc::channel::<AppState>();
+        #[cfg(not(target_os = "windows"))]
         let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel::<HotkeyEvent>();
         #[cfg(target_os = "windows")]
         let (raw_hotkey_tx, raw_hotkey_rx) = mpsc::channel();
@@ -1032,31 +1134,38 @@ impl VeilKeyApp {
         let hotkeys = HotkeyManager::new(raw_hotkey_tx).ok();
         #[cfg(target_os = "windows")]
         {
-            let hotkey_ctx = ctx.clone();
+            let runtime_state = Arc::clone(&backend_state);
+            let runtime_update_tx = backend_update_tx.clone();
+            let runtime_exit = Arc::clone(&exit_requested);
+            let runtime_state_file = state_file.clone();
             thread::spawn(move || {
-                while let Ok(hotkey) = raw_hotkey_rx.recv() {
+                while !runtime_exit.load(Ordering::Acquire) {
+                    let Ok(hotkey) = raw_hotkey_rx.recv_timeout(Duration::from_millis(200)) else {
+                        continue;
+                    };
                     let event = hotkey.event;
-                    veilkey::platform::debug_log(format!(
-                        "hotkey event forwarded id={} state={:?} foreground=0x{:x}",
-                        event.id(),
-                        event.state(),
-                        hotkey.foreground_handle
-                    ));
-                    if event.state() == HotKeyState::Pressed
-                        && let Err(error) = veilkey::platform::wake_event_loop(ui_thread_id)
-                    {
-                        veilkey::platform::debug_log(format!(
-                            "hotkey UI event-loop wake failed id={}: {error}",
-                            event.id()
-                        ));
+                    if event.state() != HotKeyState::Pressed {
+                        continue;
                     }
-                    if hotkey_event_tx.send(hotkey).is_err() {
-                        break;
+                    let Ok(mut current) = runtime_state.lock() else {
+                        continue;
+                    };
+                    match apply_backend_hotkey(&mut current, event.id(), hotkey.foreground_handle) {
+                        Ok(true) => {
+                            if let Err(error) = save_state(&runtime_state_file, &current) {
+                                veilkey::platform::debug_log(format!(
+                                    "backend state save failed: {error}"
+                                ));
+                            }
+                            let _ = runtime_update_tx.send(current.clone());
+                        }
+                        Ok(false) => {}
+                        Err(error) => veilkey::platform::debug_log(format!(
+                            "backend hotkey action failed: {error}"
+                        )),
                     }
-                    // Repaint after the thread message wakes a hidden event
-                    // loop; never show VeilKey just to consume a shortcut.
-                    hotkey_ctx.request_repaint();
                 }
+                veilkey::platform::debug_log("background hotkey service stopped");
             });
         }
         #[cfg(not(target_os = "windows"))]
@@ -1169,6 +1278,9 @@ impl VeilKeyApp {
             hotkey_retry_needed: false,
             last_hotkey_retry: Instant::now(),
             registered_hotkey_ids: HashSet::new(),
+            backend_state,
+            backend_updates,
+            #[cfg(not(target_os = "windows"))]
             hotkey_event_rx,
             recording_group: None,
             capture_armed,
@@ -1180,7 +1292,8 @@ impl VeilKeyApp {
             focused_binding_in_flight: false,
             pending_bind_group: None,
             dynamic_toggle_rx,
-            dynamic_toggle_tx,
+            #[cfg(not(target_os = "windows"))]
+            dynamic_toggle_tx: _dynamic_toggle_tx,
             dynamic_toggle_in_flight: false,
             pending_dynamic_toggles: VecDeque::new(),
             dynamic_hotkey_roles: HashMap::new(),
@@ -1221,9 +1334,23 @@ impl VeilKeyApp {
     }
 
     fn persist(&mut self) {
+        if let Ok(mut backend_state) = self.backend_state.lock() {
+            *backend_state = self.state.clone();
+        }
         match save_state(&self.state_file, &self.state) {
             Ok(()) => {}
             Err(error) => self.state.status = format!("Could not save settings: {error}"),
+        }
+    }
+
+    fn merge_backend_updates(&mut self) {
+        let mut latest = None;
+        while let Ok(state) = self.backend_updates.try_recv() {
+            latest = Some(state);
+        }
+        if let Some(state) = latest {
+            self.state.groups = state.groups;
+            self.state.dynamic_groups = state.dynamic_groups;
         }
     }
 
@@ -1777,6 +1904,7 @@ impl VeilKeyApp {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn activate_dynamic_hotkey(
         &mut self,
         role: DynamicHotkeyRole,
@@ -1794,6 +1922,7 @@ impl VeilKeyApp {
         self.start_dynamic_hotkey_lookup(role, foreground_handle);
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn start_dynamic_hotkey_lookup(
         &mut self,
         role: DynamicHotkeyRole,
@@ -1823,6 +1952,7 @@ impl VeilKeyApp {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn start_next_dynamic_toggle(&mut self) {
         if self.is_exit_requested() || self.dynamic_toggle_in_flight || self.action_in_flight {
             return;
@@ -1926,6 +2056,7 @@ impl VeilKeyApp {
         }
     }
 
+    #[cfg(not(target_os = "windows"))]
     fn handle_hotkey_events(&mut self) {
         if self.on_exit_requested() {
             while self.hotkey_event_rx.try_recv().is_ok() {}
@@ -2464,6 +2595,9 @@ impl eframe::App for VeilKeyApp {
             ctx.request_repaint_after(Duration::from_millis(8));
             return;
         }
+        // Hotkey handling continues in the backend while this viewport is
+        // minimized; merge its current binding visibility before editing.
+        self.merge_backend_updates();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         if ctx.input(|input| input.viewport().close_requested()) && !self.on_exit_requested() {
             #[cfg(target_os = "windows")]
@@ -2479,12 +2613,14 @@ impl eframe::App for VeilKeyApp {
         self.process_global_binding_capture(self.state.english_ui);
         self.complete_focused_window_bindings(self.state.english_ui);
         self.capture_hotkey(ctx);
+        #[cfg(not(target_os = "windows"))]
         self.handle_hotkey_events();
         #[cfg(target_os = "macos")]
         if self.viewport_hidden && !self.on_exit_requested() {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
         self.process_dynamic_toggle_results(self.state.english_ui);
+        #[cfg(not(target_os = "windows"))]
         self.start_next_dynamic_toggle();
         #[cfg(target_os = "windows")]
         self.sync_hidden_viewport(ctx);

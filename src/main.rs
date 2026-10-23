@@ -7,8 +7,10 @@ use global_hotkey::GlobalHotKeyEvent;
 use global_hotkey::GlobalHotKeyManager;
 use global_hotkey::HotKeyState;
 use global_hotkey::hotkey::HotKey;
+#[cfg(target_os = "windows")]
+use std::collections::BTreeSet;
 use std::collections::VecDeque;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -32,6 +34,8 @@ use veilkey::{
     AppState, BindMode, Group, WindowAction, WindowInfo, acquire_instance_lock, dynamic_target_ids,
     load_state, save_state, state_path, window_is_displayable,
 };
+
+mod icons;
 
 #[cfg(target_os = "windows")]
 mod windows_keyboard;
@@ -114,16 +118,8 @@ fn create_tray(
     let menu = Menu::new();
     menu.append_items(&[&show, &PredefinedMenuItem::separator(), &exit])
         .map_err(|error| error.to_string())?;
-    let pixels = (0_i32..32)
-        .flat_map(|y| {
-            (0_i32..32).flat_map(move |x| {
-                let stroke = (5..27).contains(&y)
-                    && ((x - (7 + (y - 5) / 2)).abs() < 2 || (x - (25 - (y - 5) / 2)).abs() < 2);
-                [0, 0, 0, if stroke { 255 } else { 0 }]
-            })
-        })
-        .collect();
-    let icon = Icon::from_rgba(pixels, 32, 32).map_err(|error| error.to_string())?;
+    let icon = Icon::from_rgba(icons::tray_rgba(), icons::TRAY_SIZE, icons::TRAY_SIZE)
+        .map_err(|error| error.to_string())?;
     let builder = TrayIconBuilder::new().with_tooltip("VeilKey");
     #[cfg(target_os = "macos")]
     let builder = builder.with_icon_templated(icon);
@@ -139,7 +135,7 @@ fn create_tray(
     let menu_sender = sender.clone();
     let menu_ctx = ctx.clone();
     let menu_exit_requested = Arc::clone(&exit_requested);
-    let menu_ui_thread_id = ui_thread_id;
+    let _menu_ui_thread_id = ui_thread_id;
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!("tray menu callback id={:?}", event.id()));
@@ -158,7 +154,7 @@ fn create_tray(
                     veilkey::platform::debug_log("tray exit flag set in callback");
                 }
                 #[cfg(target_os = "windows")]
-                if let Some(thread_id) = menu_ui_thread_id
+                if let Some(thread_id) = _menu_ui_thread_id
                     && let Err(error) = veilkey::platform::wake_event_loop(thread_id)
                 {
                     veilkey::platform::debug_log(format!(
@@ -527,6 +523,7 @@ fn preserve_logically_hidden_windows(windows: &mut [WindowInfo], hidden_ids: &Ha
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_own_window_id(window_id: &str) -> bool {
     window_id
         .split('|')
@@ -535,14 +532,17 @@ fn is_own_window_id(window_id: &str) -> bool {
         == Some(std::process::id())
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn is_main_window_id(window_id: &str) -> bool {
     is_own_window_id(window_id) && window_id.split('\0').nth(1) == Some("VeilKey")
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn main_window_is_logically_hidden(hidden_ids: &HashSet<String>) -> bool {
     hidden_ids.iter().any(|id| is_main_window_id(id))
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn reconcile_self_hidden_windows(
     windows: &[WindowInfo],
     hidden_ids: &mut HashSet<String>,
@@ -572,6 +572,7 @@ fn reconcile_self_hidden_windows(
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn apply_self_visibility_requests(hidden_ids: &mut HashSet<String>, requests: &[(String, bool)]) {
     for (id, visible) in requests {
         if *visible {
@@ -585,6 +586,7 @@ fn apply_self_visibility_requests(hidden_ids: &mut HashSet<String>, requests: &[
     }
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
 fn viewport_visibility_command(currently_hidden: bool, should_hide: bool) -> Option<bool> {
     (currently_hidden != should_hide).then_some(!should_hide)
 }
@@ -1140,18 +1142,18 @@ impl VeilKeyApp {
                 mode,
                 suffix,
                 _previous_window_ids,
-                self_hidden_window_ids,
-                foreground_handle,
+                _self_hidden_window_ids,
+                _foreground_handle,
             )) = dynamic_toggle_requests.recv()
             {
                 #[cfg(target_os = "windows")]
-                let snapshot = match foreground_handle {
+                let snapshot = match _foreground_handle {
                     Some(handle) => NativeWindowController::focused_window_snapshot_for_handle(
                         handle,
-                        &self_hidden_window_ids,
+                        &_self_hidden_window_ids,
                     ),
                     None => {
-                        NativeWindowController::focused_window_snapshot(&self_hidden_window_ids)
+                        NativeWindowController::focused_window_snapshot(&_self_hidden_window_ids)
                     }
                 };
                 #[cfg(not(target_os = "windows"))]
@@ -1172,7 +1174,7 @@ impl VeilKeyApp {
             }
         });
         let backend_state = Arc::new(Mutex::new(state.clone()));
-        let (backend_update_tx, backend_updates) = mpsc::channel::<AppState>();
+        let (_backend_update_tx, backend_updates) = mpsc::channel::<AppState>();
         #[cfg(not(target_os = "windows"))]
         let (hotkey_event_tx, hotkey_event_rx) = mpsc::channel::<HotkeyEvent>();
         #[cfg(target_os = "windows")]
@@ -1182,7 +1184,7 @@ impl VeilKeyApp {
         #[cfg(target_os = "windows")]
         {
             let runtime_state = Arc::clone(&backend_state);
-            let runtime_update_tx = backend_update_tx.clone();
+            let runtime_update_tx = _backend_update_tx.clone();
             let runtime_exit = Arc::clone(&exit_requested);
             let runtime_state_file = state_file.clone();
             thread::spawn(move || {
@@ -1595,20 +1597,20 @@ impl VeilKeyApp {
     }
 
     fn update_window_actions(&mut self) {
-        while let Ok((applied, snapshot, self_visibility_targets)) = self.action_rx.try_recv() {
+        while let Ok((applied, snapshot, _self_visibility_targets)) = self.action_rx.try_recv() {
             self.action_in_flight = false;
-            let applied_successfully = applied.is_ok();
+            let _applied_successfully = applied.is_ok();
             match applied {
                 Ok(()) => {}
                 Err(error) => self.state.status = error,
             }
             #[cfg(target_os = "windows")]
-            if applied_successfully
+            if _applied_successfully
                 && (snapshot.is_err() || snapshot.as_ref().is_ok_and(|windows| windows.is_empty()))
             {
                 apply_self_visibility_requests(
                     &mut self.self_hidden_window_ids,
-                    &self_visibility_targets,
+                    &_self_visibility_targets,
                 );
             }
             match snapshot {
@@ -1618,7 +1620,7 @@ impl VeilKeyApp {
                         reconcile_self_hidden_windows(
                             &windows,
                             &mut self.self_hidden_window_ids,
-                            &self_visibility_targets,
+                            &_self_visibility_targets,
                         );
                         retain_unrestored_targets(&mut self.dynamic_recovery, &windows);
                         self.windows = windows;
@@ -3102,7 +3104,8 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1000.0, 680.0])
-            .with_min_inner_size([780.0, 520.0]),
+            .with_min_inner_size([780.0, 520.0])
+            .with_icon(icons::application()),
         #[cfg(target_os = "macos")]
         event_loop_builder: Some(Box::new(|builder| {
             use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};

@@ -10,6 +10,7 @@ app_dir="$out_dir/VeilKey.app"
 rm -rf "$app_dir"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources"
 cp "$root_dir/target/$target/release/veilkey" "$app_dir/Contents/MacOS/VeilKey"
+cp "$root_dir/assets/icons/VeilKey.icns" "$app_dir/Contents/Resources/VeilKey.icns"
 chmod 755 "$app_dir/Contents/MacOS/VeilKey"
 cat > "$app_dir/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -19,6 +20,7 @@ cat > "$app_dir/Contents/Info.plist" <<PLIST
   <key>CFBundleDisplayName</key><string>VeilKey</string>
   <key>CFBundleIdentifier</key><string>cool.cnb.regrevia.veilkey</string>
   <key>CFBundleExecutable</key><string>VeilKey</string>
+  <key>CFBundleIconFile</key><string>VeilKey.icns</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>$version</string>
   <key>CFBundleVersion</key><string>$version</string>

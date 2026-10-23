@@ -1,0 +1,52 @@
+name: Verify builds
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  platform:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo fmt --all -- --check
+      - run: cargo test --all-targets
+      - run: cargo check --all-targets --target ${{ matrix.target }}
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
+      - run: cargo build --release --target ${{ matrix.target }}
+      - name: Install Inno Setup
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: choco install innosetup --no-progress --yes
+      - name: Build Windows packages and smoke test installer
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: .\packaging\windows\build.ps1 -OutputDirectory 'packaging/output' -SmokeTest
+      - name: Build macOS app bundle
+        if: startsWith(matrix.target, 'aarch64-apple') || startsWith(matrix.target, 'x86_64-apple')
+        shell: bash
+        run: |
+          version="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)"
+          bash packaging/macos/build-app.sh "${{ matrix.target }}" "$version" packaging/output

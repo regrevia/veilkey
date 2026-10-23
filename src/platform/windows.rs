@@ -568,6 +568,15 @@ fn expected_process_id(window_id: &str) -> Option<u32> {
         .ok()
 }
 
+fn expected_process_name(window_id: &str) -> Option<&str> {
+    window_id.split('\0').next().filter(|name| !name.is_empty())
+}
+
+fn process_identity_matches(window_id: &str, actual_process_name: &str) -> bool {
+    expected_process_name(window_id)
+        .is_some_and(|expected| expected.eq_ignore_ascii_case(actual_process_name))
+}
+
 fn validated_window_title(hwnd: HWND, window_id: &str) -> Option<String> {
     let expected_pid = expected_process_id(window_id)?;
     unsafe {
@@ -579,8 +588,13 @@ fn validated_window_title(hwnd: HWND, window_id: &str) -> Option<String> {
         if actual_pid == 0 || actual_pid != expected_pid {
             return None;
         }
-        let title = window_title(hwnd)?;
-        (Some(title.as_str()) == window_id.split('\0').nth(1)).then_some(title)
+        if !process_identity_matches(window_id, &process_name(actual_pid)) {
+            return None;
+        }
+        // Titles change during normal use (for example, when browser tabs or
+        // editor documents change). HWND, PID and executable identify control;
+        // the title is only used for diagnostics.
+        window_title(hwnd)
     }
 }
 
@@ -837,6 +851,18 @@ mod tests {
         );
         assert_eq!(expected_process_id("app.exe\\0title\\00|hwnd:1a2b"), None);
         assert_eq!(expected_process_id("app.exe\\0title\\00"), None);
+    }
+
+    #[test]
+    fn process_identity_uses_executable_name_and_allows_title_changes() {
+        let saved = concat!("browser.exe\0First tab\0", "0|hwnd:1a2b|pid:42");
+        let current_title_id = concat!("browser.exe\0Second tab\0", "0|hwnd:1a2b|pid:42");
+        assert!(process_identity_matches(saved, "BROWSER.EXE"));
+        assert_eq!(
+            expected_process_name(saved),
+            expected_process_name(current_title_id)
+        );
+        assert!(!process_identity_matches(saved, "editor.exe"));
     }
 
     #[test]

@@ -30,7 +30,7 @@ jobs:
         run: choco install innosetup --no-progress --yes
       - name: Build installer and portable executable
         shell: pwsh
-        run: .\packaging\windows\build.ps1 -OutputDirectory 'packaging/output'
+        run: .\packaging\windows\build.ps1 -OutputDirectory 'packaging/output' -SmokeTest
       - name: Smoke test installer and uninstaller
         shell: pwsh
         run: |

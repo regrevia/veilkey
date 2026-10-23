@@ -1,7 +1,8 @@
 param(
     [string]$Version,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\..\packaging\output'),
-    [string]$CompilerPath
+    [string]$CompilerPath,
+    [switch]$SmokeTest
 )
 
 $ErrorActionPreference = 'Stop'
@@ -27,13 +28,15 @@ if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
 
 if ([string]::IsNullOrWhiteSpace($CompilerPath)) {
     $compilerCandidates = @(
+        (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 7\ISCC.exe'),
         (Join-Path ([Environment]::GetFolderPath('ProgramFilesX86')) 'Inno Setup 6\ISCC.exe'),
+        (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Inno Setup 7\ISCC.exe'),
         (Join-Path ([Environment]::GetFolderPath('ProgramFiles')) 'Inno Setup 6\ISCC.exe')
     )
     $CompilerPath = $compilerCandidates | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } | Select-Object -First 1
 }
 if ([string]::IsNullOrWhiteSpace($CompilerPath) -or -not (Test-Path -LiteralPath $CompilerPath -PathType Leaf)) {
-    throw 'Inno Setup 6 compiler ISCC.exe was not found. Install Inno Setup 6 or pass -CompilerPath.'
+    throw 'Inno Setup compiler ISCC.exe was not found. Install Inno Setup 6 or 7, or pass -CompilerPath.'
 }
 
 if (-not [System.IO.Path]::IsPathRooted($OutputDirectory)) {
@@ -68,10 +71,12 @@ $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $portablePath).Hash
 if ($portableHash -ne $sourceHash) {
     throw 'Portable executable differs from the release build.'
 }
-$installerItem = Get-Item -LiteralPath $installerPath
-$smokeTest = Join-Path $PSScriptRoot 'smoke-test-installer.ps1'
-& $smokeTest -InstallerPath $installerItem.FullName -ExpectedExecutableSha256 $sourceHash
-if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
-    throw "Installer smoke test failed with exit code $LASTEXITCODE."
+if ($SmokeTest) {
+    $installerItem = Get-Item -LiteralPath $installerPath
+    $smokeTestScript = Join-Path $PSScriptRoot 'smoke-test-installer.ps1'
+    & $smokeTestScript -InstallerPath $installerItem.FullName -ExpectedExecutableSha256 $sourceHash
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        throw "Installer smoke test failed with exit code $LASTEXITCODE."
+    }
 }
 Get-FileHash -Algorithm SHA256 -LiteralPath $installerPath, $portablePath

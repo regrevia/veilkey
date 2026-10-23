@@ -3,9 +3,9 @@ use accessibility_sys::{
     AXIsProcessTrusted, AXUIElementCopyAttributeValue, AXUIElementCreateApplication,
     AXUIElementCreateSystemWide, AXUIElementRef, AXUIElementSetAttributeValue,
     AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetValue, kAXErrorSuccess,
-    kAXFocusedWindowAttribute, kAXHiddenAttribute, kAXMinimizedAttribute, kAXPositionAttribute,
-    kAXSizeAttribute, kAXTitleAttribute, kAXValueTypeCGPoint, kAXValueTypeCGSize,
-    kAXWindowsAttribute,
+    kAXFocusedApplicationAttribute, kAXFocusedWindowAttribute, kAXHiddenAttribute,
+    kAXMinimizedAttribute, kAXPositionAttribute, kAXSizeAttribute, kAXTitleAttribute,
+    kAXValueTypeCGPoint, kAXValueTypeCGSize, kAXWindowsAttribute,
 };
 use core_foundation_sys::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
 use core_foundation_sys::base::{
@@ -45,6 +45,20 @@ struct RawWindow {
 pub struct NativeWindowController;
 
 impl NativeWindowController {
+    pub fn enumerate_fast() -> Result<Vec<WindowInfo>, String> {
+        // Keep the shared backend contract available on macOS. A cached fast
+        // path can replace this implementation without changing callers.
+        Self::enumerate()
+    }
+
+    pub fn screen_capture_authorized() -> bool {
+        unsafe { CGPreflightScreenCaptureAccess() }
+    }
+
+    pub fn request_screen_capture_access() -> bool {
+        unsafe { CGRequestScreenCaptureAccess() }
+    }
+
     pub fn foreground_window_id() -> Result<Option<String>, String> {
         if !unsafe { AXIsProcessTrusted() } {
             return Err(
@@ -58,8 +72,17 @@ impl NativeWindowController {
         unsafe {
             AXUIElementSetMessagingTimeout(system, 0.25);
         }
-        let focused = copy_value(system, kAXFocusedWindowAttribute);
+        let focused_application = copy_value(system, kAXFocusedApplicationAttribute);
         unsafe { CFRelease(system as CFTypeRef) };
+        let Some(focused_application) = focused_application else {
+            return Ok(None);
+        };
+        let focused_application = focused_application as AXUIElementRef;
+        unsafe {
+            AXUIElementSetMessagingTimeout(focused_application, 0.25);
+        }
+        let focused = copy_value(focused_application, kAXFocusedWindowAttribute);
+        unsafe { CFRelease(focused_application as CFTypeRef) };
         let Some(focused) = focused else {
             return Ok(None);
         };
@@ -106,6 +129,8 @@ impl NativeWindowController {
                     app: w.app.clone(),
                     rect: w.rect,
                     visible: w.visible,
+                    process_id: w.pid as u32,
+                    preview: None,
                 }
             })
             .collect();
@@ -171,6 +196,12 @@ impl NativeWindowController {
             Err(errors.join("; "))
         }
     }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGPreflightScreenCaptureAccess() -> bool;
+    fn CGRequestScreenCaptureAccess() -> bool;
 }
 
 fn collect_windows() -> Result<Vec<RawWindow>, String> {
@@ -319,7 +350,7 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
             restore_rect,
             ..
         } => {
-            if visible && let Some(rect) = restore_rect {
+            let rect_result = if visible && let Some(rect) = restore_rect {
                 // Keep the shared action's restore geometry effective on macOS;
                 // Windows combines this with showing the window in one native call.
                 apply_to_window(
@@ -329,8 +360,10 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
                         handle: 0,
                         rect,
                     },
-                )?;
-            }
+                )
+            } else {
+                Ok(())
+            };
             let attribute = cf_string(kAXMinimizedAttribute)?;
             let value = unsafe {
                 if visible {
@@ -344,7 +377,16 @@ fn apply_to_window(window: AXUIElementRef, action: WindowAction) -> Result<(), S
             unsafe {
                 CFRelease(attribute as CFTypeRef);
             }
-            ax_result(result)
+            let visibility_result = ax_result(result);
+            match (rect_result, visibility_result) {
+                (Ok(()), result) => result,
+                (Err(rect_error), Ok(())) => Err(format!(
+                    "Window was shown, but its saved position could not be restored: {rect_error}"
+                )),
+                (Err(rect_error), Err(visibility_error)) => Err(format!(
+                    "Could not restore the window position ({rect_error}) or visibility ({visibility_error})"
+                )),
+            }
         }
         WindowAction::SetVisible { .. } => {
             Err("Application hide action requires an app target".into())

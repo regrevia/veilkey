@@ -15,14 +15,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest]
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - run: cargo fmt --all -- --check
       - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo check --all-targets --target ${{ matrix.target }}
+      - run: cargo clippy --all-targets --target ${{ matrix.target }} -- -D warnings
 
   windows:
     needs: verify
@@ -46,13 +55,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force -Path 'packaging/output' | Out-Null
-          & 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe' "/DAppVersion=${{ steps.version.outputs.version }}" "/DSourceDir=$((Get-Location).Path)" "/DBinaryPath=$((Get-Location).Path)\target\x86_64-pc-windows-msvc\release\veilkey.exe" 'packaging/windows/veilkey.iss'
-          Copy-Item 'target/x86_64-pc-windows-msvc/release/veilkey.exe' 'packaging/output/VeilKey.exe'
-          $portableHash = (Get-FileHash -Algorithm SHA256 -LiteralPath 'packaging/output/VeilKey.exe').Hash
-          $installedSourceHash = (Get-FileHash -Algorithm SHA256 -LiteralPath 'target/x86_64-pc-windows-msvc/release/veilkey.exe').Hash
-          if ($portableHash -ne $installedSourceHash) { throw 'Portable executable differs from the release build.' }
-          $installer = Get-Item 'packaging/output/VeilKey-Setup.exe'
-          .\packaging\windows\smoke-test-installer.ps1 -InstallerPath $installer.FullName -ExpectedExecutableSha256 $portableHash
+          .\packaging\windows\build.ps1 -OutputDirectory 'packaging/output' -SmokeTest
       - uses: softprops/action-gh-release@v2
         with:
           files: |
@@ -65,9 +68,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             target: aarch64-apple-darwin
-          - os: macos-14
+          - os: macos-15-intel
             target: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:

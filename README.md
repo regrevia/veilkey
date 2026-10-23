@@ -1,5 +1,7 @@
 # VeilKey
 
+<p align="center"><img src="assets/icons/app-256.png" width="160" alt="VeilKey icon"></p>
+
 VeilKey is a small desktop utility for binding several application windows into a named group and showing or hiding that group with one global keyboard shortcut. It aims to restore each window to its saved position and size when shown again.
 
 This is an independent clean-room project. The earlier project informed only the general product idea; no source code, artwork, or documentation was carried over.

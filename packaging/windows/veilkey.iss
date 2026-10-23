@@ -33,6 +33,7 @@ UninstallDisplayIcon={app}\veilkey.exe
 ArchitecturesInstallIn64BitMode=x64
 ArchitecturesAllowed=x64
 LicenseFile={#SourceDir}\LICENSE
+SetupIconFile={#SourceDir}\assets\icons\veilkey.ico
 
 [Languages]
 Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
@@ -41,14 +42,14 @@ Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.i
 Source: "{#BinaryPath}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\VeilKey"; Filename: "{app}\veilkey.exe"
-Name: "{autodesktop}\VeilKey"; Filename: "{app}\veilkey.exe"; Tasks: desktopicon
+Name: "{group}\VeilKey"; Filename: "{app}\veilkey.exe"; IconFilename: "{app}\veilkey.exe"; IconIndex: 0
+Name: "{autodesktop}\VeilKey"; Filename: "{app}\veilkey.exe"; IconFilename: "{app}\veilkey.exe"; IconIndex: 0; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加选项："; Flags: unchecked
 
 [Run]
-Filename: "{app}\veilkey.exe"; Description: "Launch VeilKey"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\veilkey.exe"; Description: "启动 VeilKey"; Flags: nowait postinstall skipifsilent
 
 [Code]
 function PrepareToInstall(var NeedsRestart: Boolean): String;

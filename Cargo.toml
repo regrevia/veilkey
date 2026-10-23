@@ -22,3 +22,7 @@ tray-icon = "0.26.1"
 [target.'cfg(target_os = "macos")'.dependencies]
 accessibility-sys = "0.2"
 core-foundation-sys = "0.8"
+winit = "0.30"
+
+[target.'cfg(target_os = "windows")'.build-dependencies]
+winresource = "0.1.34"

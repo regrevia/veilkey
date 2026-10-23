@@ -102,6 +102,7 @@ fn localized_status(english: bool, status: &str) -> String {
 fn create_tray(
     ctx: &egui::Context,
     exit_requested: Arc<AtomicBool>,
+    ui_thread_id: Option<u32>,
 ) -> Result<(tray_icon::TrayIcon, Receiver<TrayCommand>, Arc<AtomicBool>), String> {
     use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
     use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
@@ -138,6 +139,7 @@ fn create_tray(
     let menu_sender = sender.clone();
     let menu_ctx = ctx.clone();
     let menu_exit_requested = Arc::clone(&exit_requested);
+    let menu_ui_thread_id = ui_thread_id;
     MenuEvent::set_event_handler(Some(move |event: MenuEvent| {
         #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!("tray menu callback id={:?}", event.id()));
@@ -147,27 +149,34 @@ fn create_tray(
             _ => None,
         };
         if let Some(command) = command {
-            if matches!(command, TrayCommand::Exit) {
+            let first_exit_request = if matches!(command, TrayCommand::Exit) {
                 // Set this directly from the tray callback. A hidden viewport
                 // may not immediately consume the command channel.
-                menu_exit_requested.store(true, Ordering::Release);
+                let first = !menu_exit_requested.swap(true, Ordering::AcqRel);
                 #[cfg(target_os = "windows")]
-                veilkey::platform::debug_log("tray exit flag set in callback");
-                #[cfg(target_os = "windows")]
-                match veilkey::platform::wake_main_window() {
-                    Ok(hwnd) => veilkey::platform::debug_log(format!(
-                        "tray exit woke native window hwnd=0x{hwnd:x}"
-                    )),
-                    Err(error) => veilkey::platform::debug_log(format!(
-                        "tray exit native wake failed: {error}"
-                    )),
+                if first {
+                    veilkey::platform::debug_log("tray exit flag set in callback");
                 }
-                menu_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                #[cfg(target_os = "windows")]
+                if let Some(thread_id) = menu_ui_thread_id
+                    && let Err(error) = veilkey::platform::wake_event_loop(thread_id)
+                {
+                    veilkey::platform::debug_log(format!(
+                        "tray exit UI event-loop wake failed: {error}"
+                    ));
+                }
+                first
             } else if matches!(command, TrayCommand::Show) {
+                menu_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                 menu_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 menu_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                false
+            } else {
+                false
+            };
+            if !matches!(command, TrayCommand::Exit) || first_exit_request {
+                let _ = menu_sender.send(command);
             }
-            let _ = menu_sender.send(command);
             menu_ctx.request_repaint();
         }
     }));
@@ -196,6 +205,7 @@ fn create_tray(
                 }
             }
             let _ = sender.send(TrayCommand::Show);
+            tray_ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
             tray_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
             tray_ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
             tray_ctx.request_repaint();
@@ -377,10 +387,6 @@ struct VeilKeyApp {
     exit_cleanup_completed: bool,
     #[cfg(any(target_os = "macos", target_os = "windows"))]
     viewport_hidden: bool,
-    #[cfg(target_os = "windows")]
-    wake_for_hidden_viewport: Arc<AtomicBool>,
-    #[cfg(target_os = "windows")]
-    tray_hidden: bool,
     queued_toggles: VecDeque<String>,
     preview_textures: HashMap<String, egui::TextureHandle>,
     preview_pixels: HashMap<String, veilkey::WindowPreview>,
@@ -577,6 +583,10 @@ fn apply_self_visibility_requests(hidden_ids: &mut HashSet<String>, requests: &[
 
 fn viewport_visibility_command(currently_hidden: bool, should_hide: bool) -> Option<bool> {
     (currently_hidden != should_hide).then_some(!should_hide)
+}
+
+fn close_to_tray_viewport_command() -> egui::ViewportCommand {
+    egui::ViewportCommand::Minimized(true)
 }
 
 fn available_suffixes() -> Vec<(String, String)> {
@@ -797,8 +807,10 @@ enum TrayCommand {
 impl VeilKeyApp {
     fn new(instance_lock: File, ctx: &egui::Context) -> Self {
         #[cfg(target_os = "windows")]
+        let ui_thread_id = unsafe { windows::Win32::System::Threading::GetCurrentThreadId() };
+        #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!(
-            "application started diagnostic=windows-self-window-wake-2 pid={}",
+            "application started diagnostic=windows-ui-thread-wake-3 pid={}",
             std::process::id()
         ));
         let state_file = state_path();
@@ -859,15 +871,20 @@ impl VeilKeyApp {
         }
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let exit_requested = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "windows")]
+        let ui_thread_id_for_tray = Some(ui_thread_id);
+        #[cfg(target_os = "macos")]
+        let ui_thread_id_for_tray = None;
         #[cfg(any(target_os = "macos", target_os = "windows"))]
-        let (tray_icon, tray_events, exit_requested) = match create_tray(ctx, exit_requested) {
-            Ok(tray) => (Some(tray.0), tray.1, tray.2),
-            Err(error) => {
-                eprintln!("Could not create VeilKey notification-area icon: {error}");
-                let (_sender, receiver) = mpsc::channel();
-                (None, receiver, Arc::new(AtomicBool::new(false)))
-            }
-        };
+        let (tray_icon, tray_events, exit_requested) =
+            match create_tray(ctx, exit_requested, ui_thread_id_for_tray) {
+                Ok(tray) => (Some(tray.0), tray.1, tray.2),
+                Err(error) => {
+                    eprintln!("Could not create VeilKey notification-area icon: {error}");
+                    let (_sender, receiver) = mpsc::channel();
+                    (None, receiver, Arc::new(AtomicBool::new(false)))
+                }
+            };
         for group in &mut state.groups {
             group.hotkey_draft = group.hotkey.clone().unwrap_or_default();
         }
@@ -1012,45 +1029,33 @@ impl VeilKeyApp {
         #[cfg(target_os = "windows")]
         let (raw_hotkey_tx, raw_hotkey_rx) = mpsc::channel();
         #[cfg(target_os = "windows")]
-        let wake_for_hidden_viewport = Arc::new(AtomicBool::new(false));
-        #[cfg(target_os = "windows")]
-        let exit_requested_for_hotkeys = Arc::clone(&exit_requested);
-        #[cfg(target_os = "windows")]
         let hotkeys = HotkeyManager::new(raw_hotkey_tx).ok();
         #[cfg(target_os = "windows")]
         {
-            let wake_ctx = ctx.clone();
-            let wake_required = Arc::clone(&wake_for_hidden_viewport);
+            let hotkey_ctx = ctx.clone();
             thread::spawn(move || {
-                while let Ok(mut hotkey) = raw_hotkey_rx.recv() {
+                while let Ok(hotkey) = raw_hotkey_rx.recv() {
                     let event = hotkey.event;
-                    let needs_native_wake = event.state() == HotKeyState::Pressed
-                        && wake_required.load(Ordering::Acquire)
-                        && !exit_requested_for_hotkeys.load(Ordering::Acquire);
-                    hotkey.woke_hidden_viewport = needs_native_wake;
                     veilkey::platform::debug_log(format!(
-                        "hotkey event forwarded id={} state={:?} foreground=0x{:x} viewport_hidden={needs_native_wake}",
+                        "hotkey event forwarded id={} state={:?} foreground=0x{:x}",
                         event.id(),
                         event.state(),
                         hotkey.foreground_handle
                     ));
-                    if needs_native_wake {
-                        match veilkey::platform::wake_main_window() {
-                            Ok(hwnd) => veilkey::platform::debug_log(format!(
-                                "hotkey native wake succeeded id={} hwnd=0x{hwnd:x}",
-                                event.id()
-                            )),
-                            Err(error) => veilkey::platform::debug_log(format!(
-                                "hotkey native wake failed id={}: {error}",
-                                event.id()
-                            )),
-                        }
-                        wake_ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                    if event.state() == HotKeyState::Pressed
+                        && let Err(error) = veilkey::platform::wake_event_loop(ui_thread_id)
+                    {
+                        veilkey::platform::debug_log(format!(
+                            "hotkey UI event-loop wake failed id={}: {error}",
+                            event.id()
+                        ));
                     }
-                    wake_ctx.request_repaint();
                     if hotkey_event_tx.send(hotkey).is_err() {
                         break;
                     }
+                    // Repaint after the thread message wakes a hidden event
+                    // loop; never show VeilKey just to consume a shortcut.
+                    hotkey_ctx.request_repaint();
                 }
             });
         }
@@ -1193,10 +1198,6 @@ impl VeilKeyApp {
             exit_cleanup_completed: false,
             #[cfg(any(target_os = "macos", target_os = "windows"))]
             viewport_hidden: false,
-            #[cfg(target_os = "windows")]
-            wake_for_hidden_viewport,
-            #[cfg(target_os = "windows")]
-            tray_hidden: false,
             queued_toggles: VecDeque::new(),
             preview_textures: HashMap::new(),
             preview_pixels: HashMap::new(),
@@ -1405,27 +1406,10 @@ impl VeilKeyApp {
             return;
         }
         #[cfg(target_os = "windows")]
-        let hides_main_window = actions.iter().any(|action| {
-            matches!(
-                action,
-                WindowAction::SetVisible {
-                    window_id,
-                    visible: false,
-                    ..
-                } if is_main_window_id(window_id)
-            )
-        });
-        #[cfg(target_os = "windows")]
         veilkey::platform::debug_log(format!("queue window actions count={}", actions.len()));
         match self.action_tx.try_send(WindowActionRequest::Apply(actions)) {
             Ok(()) => {
                 self.action_in_flight = true;
-                #[cfg(target_os = "windows")]
-                if hides_main_window {
-                    // Once the native HWND is hidden, eframe stops producing
-                    // frames. The next global hotkey must wake it to consume events.
-                    self.wake_for_hidden_viewport.store(true, Ordering::Release);
-                }
             }
             Err(mpsc::TrySendError::Full(_)) => {
                 self.state.status = "Window operation is already in progress.".into();
@@ -1472,14 +1456,6 @@ impl VeilKeyApp {
                         self.state.status = error;
                     }
                 }
-            }
-            #[cfg(target_os = "windows")]
-            if !self_visibility_targets.is_empty() {
-                self.wake_for_hidden_viewport.store(
-                    self.tray_hidden
-                        || main_window_is_logically_hidden(&self.self_hidden_window_ids),
-                    Ordering::Release,
-                );
             }
         }
         if !self.action_in_flight
@@ -1971,10 +1947,6 @@ impl VeilKeyApp {
             if event.state() != HotKeyState::Pressed {
                 continue;
             }
-            #[cfg(target_os = "windows")]
-            if input.woke_hidden_viewport {
-                self.viewport_hidden = false;
-            }
             if let Some(role) = self.dynamic_hotkey_roles.get(&event.id()).cloned() {
                 dynamic_toggle = Some((role, foreground_handle));
                 break;
@@ -2039,12 +2011,7 @@ impl VeilKeyApp {
             match command {
                 TrayCommand::Show => {
                     self.viewport_hidden = false;
-                    #[cfg(target_os = "windows")]
-                    {
-                        self.tray_hidden = false;
-                        self.wake_for_hidden_viewport
-                            .store(false, Ordering::Release);
-                    }
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -2443,22 +2410,31 @@ impl VeilKeyApp {
         {
             return;
         }
-        let should_hide =
-            self.tray_hidden || main_window_is_logically_hidden(&self.self_hidden_window_ids);
-        self.wake_for_hidden_viewport
-            .store(should_hide, Ordering::Release);
+        // Keep the native viewport minimized while VeilKey lives in the tray.
+        // A genuinely hidden winit window stops receiving reliable repaint
+        // events, which strands global shortcuts in the UI event queue.
+        let should_hide = main_window_is_logically_hidden(&self.self_hidden_window_ids);
         if let Some(visible) = viewport_visibility_command(self.viewport_hidden, should_hide) {
             self.viewport_hidden = should_hide;
             veilkey::platform::debug_log(format!(
-                "viewport visibility transition visible={visible}"
+                "viewport minimized transition minimized={}",
+                !visible
             ));
-            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(visible));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(!visible));
+            if visible {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
         }
     }
 }
 
 impl eframe::App for VeilKeyApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.exit_cleanup_completed {
+            #[cfg(target_os = "windows")]
+            veilkey::platform::debug_log("exit process shutdown after completed restoration");
+            return;
+        }
         if let Ok(windows) = NativeWindowController::enumerate_fast() {
             self.windows = windows;
         }
@@ -2482,18 +2458,19 @@ impl eframe::App for VeilKeyApp {
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.process_tray_commands(ctx);
         #[cfg(any(target_os = "macos", target_os = "windows"))]
+        if self.on_exit_requested() {
+            // The restore worker owns exit cleanup. Avoid hotkey retries,
+            // enumeration, and UI work while waiting for its completion.
+            ctx.request_repaint_after(Duration::from_millis(8));
+            return;
+        }
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if ctx.input(|input| input.viewport().close_requested()) && !self.on_exit_requested() {
             #[cfg(target_os = "windows")]
-            veilkey::platform::debug_log("main window close requested; beginning graceful exit");
-            // Closing with X means exit. The tray can still hide VeilKey
-            // intentionally; closing the last UI surface should never leave
-            // its global shortcuts active in the background.
+            veilkey::platform::debug_log("main window close requested; minimizing to tray");
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.capture_armed.store(false, Ordering::Release);
-            self.queued_toggles.clear();
-            self.pending_dynamic_toggles.clear();
-            self.exit_requested.store(true, Ordering::Release);
-            ctx.request_repaint();
+            ctx.send_viewport_cmd(close_to_tray_viewport_command());
+            self.viewport_hidden = false;
         }
         self.update_window_snapshot();
         self.update_window_actions();
@@ -3103,6 +3080,14 @@ mod tests {
         // finishes the window action; completion can then hide the viewport once.
         let awakened = false;
         assert_eq!(viewport_visibility_command(awakened, true), Some(false));
+    }
+
+    #[test]
+    fn closing_to_tray_minimizes_instead_of_hiding_the_event_loop_window() {
+        assert!(matches!(
+            close_to_tray_viewport_command(),
+            egui::ViewportCommand::Minimized(true)
+        ));
     }
 
     #[test]

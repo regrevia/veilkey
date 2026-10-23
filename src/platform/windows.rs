@@ -9,7 +9,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Foundation::{BOOL, CloseHandle, HWND, LPARAM, RECT};
 use windows::Win32::Graphics::Gdi::{
     GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromRect, MonitorFromWindow,
-    RDW_ALLCHILDREN, RDW_INVALIDATE, RedrawWindow,
 };
 use windows::Win32::System::Threading::{
     OpenProcess, PROCESS_NAME_FORMAT, PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
@@ -18,13 +17,22 @@ use windows::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GWL_EXSTYLE, GetDesktopWindow, GetForegroundWindow, GetShellWindow,
     GetWindowLongPtrW, GetWindowPlacement, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
     GetWindowThreadProcessId, HWND_NOTOPMOST, HWND_TOP, HWND_TOPMOST, IsIconic, IsWindow,
-    IsWindowVisible, SW_HIDE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER,
-    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow, SetWindowPlacement,
-    SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
+    IsWindowVisible, SW_HIDE, SW_RESTORE, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SetForegroundWindow,
+    SetWindowPlacement, SetWindowPos, ShowWindowAsync, WINDOWPLACEMENT, WS_EX_TOOLWINDOW,
 };
 
 pub fn foreground_window_handle() -> isize {
     unsafe { GetForegroundWindow().0 as isize }
+}
+
+/// Wakes the UI thread's message pump without making the VeilKey window visible.
+pub fn wake_event_loop(thread_id: u32) -> Result<(), String> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{PostThreadMessageW, WM_NULL};
+
+    unsafe { PostThreadMessageW(thread_id, WM_NULL, WPARAM::default(), LPARAM::default()) }
+        .map_err(|error| format!("Could not wake VeilKey's UI event loop: {error}"))
 }
 
 fn focused_window_id_for_handle(
@@ -128,15 +136,6 @@ pub fn wake_main_window() -> Result<isize, String> {
         target.0 as usize
     ));
     Ok(target.0 as isize)
-}
-
-unsafe fn refresh_window_surface(hwnd: HWND) {
-    unsafe {
-        // Invalidate without erasing or forcing synchronous cross-process
-        // painting. GPU-backed windows can expose a black surface when their
-        // background is erased before their renderer produces a new frame.
-        let _ = RedrawWindow(hwnd, None, None, RDW_INVALIDATE | RDW_ALLCHILDREN);
-    }
 }
 
 #[derive(Clone)]
@@ -392,6 +391,12 @@ impl NativeWindowController {
                     ..
                 } => unsafe {
                     if visible {
+                        // IsWindowVisible is also true for minimized windows.
+                        // Restore first so exit cleanup returns the target to
+                        // the taskbar and desktop before VeilKey terminates.
+                        if IsIconic(hwnd).as_bool() {
+                            let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                        }
                         if let Some(rect) = restore_rect {
                             let rect = rect_to_native(rect);
                             let flags = SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER;
@@ -410,9 +415,6 @@ impl NativeWindowController {
                                 flags,
                             )
                             .map_err(|e| e.to_string())
-                            .map(|()| {
-                                refresh_window_surface(hwnd);
-                            })
                         } else if force_popup {
                             SetWindowPos(
                                 hwnd,
@@ -428,14 +430,10 @@ impl NativeWindowController {
                                     | SWP_NOOWNERZORDER,
                             )
                             .map_err(|e| e.to_string())
-                            .map(|()| {
-                                refresh_window_surface(hwnd);
-                            })
                         } else {
                             // Do not touch z-order for the default game-friendly path.
                             // ShowWindowAsync returns the previous visibility state, not success.
                             let _ = ShowWindowAsync(hwnd, SW_SHOWNOACTIVATE);
-                            refresh_window_surface(hwnd);
                             Ok(())
                         }
                     } else {
@@ -736,6 +734,44 @@ fn process_name(pid: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hidden_hotkey_wake_posts_a_thread_message_without_showing_a_window() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        use windows::Win32::System::Threading::GetCurrentThreadId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetMessageW, MSG, PM_NOREMOVE, PeekMessageW,
+        };
+
+        let (thread_id_tx, thread_id_rx) = mpsc::channel();
+        let (message_tx, message_rx) = mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            // Force creation of this thread's message queue before publishing
+            // its id, as required by PostThreadMessageW.
+            let mut message = MSG::default();
+            unsafe {
+                let _ = PeekMessageW(&mut message, None, 0, 0, PM_NOREMOVE);
+            }
+            thread_id_tx
+                .send(unsafe { GetCurrentThreadId() })
+                .expect("send UI thread id");
+            unsafe { GetMessageW(&mut message, None, 0, 0) }.expect("receive thread message");
+            message_tx
+                .send(message.message)
+                .expect("send received message");
+        });
+
+        let thread_id = thread_id_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("UI thread initialized its message queue");
+        wake_event_loop(thread_id).expect("post a wake message to the hidden UI");
+        let message = message_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("hidden UI message loop receives its wake");
+        assert_eq!(message, windows::Win32::UI::WindowsAndMessaging::WM_NULL);
+        waiter.join().expect("wake test thread exits");
+    }
 
     #[test]
     fn stopping_window_enumeration_after_finding_target_is_success() {

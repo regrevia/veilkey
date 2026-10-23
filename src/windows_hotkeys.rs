@@ -12,7 +12,6 @@ use windows::Win32::UI::WindowsAndMessaging::{
 pub struct HotkeyEvent {
     pub event: global_hotkey::GlobalHotKeyEvent,
     pub foreground_handle: isize,
-    pub woke_hidden_viewport: bool,
 }
 
 enum Command {
@@ -118,7 +117,6 @@ fn run_message_thread(
                 .send(HotkeyEvent {
                     event,
                     foreground_handle,
-                    woke_hidden_viewport: false,
                 })
                 .is_err()
             {

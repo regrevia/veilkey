@@ -1,9 +1,10 @@
 ## 0.2.26 - 2026-10-22
 
-- Treat closing the main window with X as a graceful app exit that restores bound windows; keep background shortcuts active only when the user explicitly hides VeilKey to the tray.
+- Keep VeilKey's message loop alive by minimizing it to the tray on X, and avoid forced redraws of GPU-backed target windows when showing a group.
+- Restore minimized targets to the desktop before tray exit, deduplicate exit requests, and skip redundant shutdown restoration after cleanup succeeds.
 - Add multi-window groups with one global shortcut, including selection count feedback and collapsible group members.
 - Keep hidden VeilKey window state stable while global shortcuts wake the native viewport, avoiding repeated visibility commands that can produce black frames.
-- Preserve the foreground application during Windows group operations and refresh GPU-backed window surfaces without erasing their contents.
+- Preserve the foreground application during Windows group operations and let GPU-backed target windows repaint naturally after they are shown.
 - Keep a hidden dynamic shortcut slot bound to its saved windows when Windows shifts foreground focus automatically; dispatch group visibility changes together to reduce staggered transitions.
 - Report partial dynamic shortcut registration accurately, retry the full configured range, and explain how to use saved multi-window groups when every dynamic shortcut is occupied.
 - Add a Windows-only preview packaging workflow that builds the installer and portable executable, verifies a full installer/uninstaller cycle, and uploads temporary CI artifacts without creating a Release.
